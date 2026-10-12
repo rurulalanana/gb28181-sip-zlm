@@ -1,0 +1,25 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+*.class
+*.jar
+*.war
+*.ear
+*.log
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+
+# 本地配置与凭据
+*.local
+.env
