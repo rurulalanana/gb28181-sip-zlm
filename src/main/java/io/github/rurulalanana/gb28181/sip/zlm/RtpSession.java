@@ -29,6 +29,10 @@ public class RtpSession {
     private final String ssrc;
     /** 设备声明的 SSRC（RTP 过滤用；null/0 = 不过滤）。 */
     private final String deviceSsrc;
+    /** 会话类型：实时 / 回放 / 下载。 */
+    private final MediaType type;
+    /** 回放或下载的媒体标识（SDP {@code u=} 行）：设备录像的 FilePath 等。 */
+    private final String mediaUri;
     /** 传输模式：0 = UDP，1 = TCP 被动（ZLM 监听，设备接入）。 */
     private final int tcpMode;
     /** SIP Call-ID（BYE 时按此关闭）。 */
@@ -43,7 +47,8 @@ public class RtpSession {
     private final long createdAt = System.currentTimeMillis();
 
     public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
-                      int tcpMode, String callId, MK_RTP_SERVER handle, int port) {
+                      int tcpMode, String callId, MK_RTP_SERVER handle, int port,
+                      MediaType type, String mediaUri) {
         this.channelId = channelId;
         this.deviceId = deviceId;
         this.ssrc = ssrc;
@@ -52,6 +57,17 @@ public class RtpSession {
         this.callId = callId;
         this.handle = handle;
         this.port = port;
+        this.type = type == null ? MediaType.REALTIME : type;
+        this.mediaUri = mediaUri;
+    }
+
+    public MediaType getType() {
+        return type;
+    }
+
+    /** 回放/下载的媒体标识（SDP {@code u=}）。 */
+    public String getMediaUri() {
+        return mediaUri;
     }
 
     public String getChannelId() {
@@ -119,7 +135,7 @@ public class RtpSession {
 
     @Override
     public String toString() {
-        return "RtpSession{channel=" + channelId + ", port=" + port + ", ssrc=" + ssrc
-                + ", tcp=" + (tcpMode == 1) + ", state=" + state + '}';
+        return "RtpSession{channel=" + channelId + ", type=" + type + ", port=" + port
+                + ", ssrc=" + ssrc + ", tcp=" + (tcpMode == 1) + ", state=" + state + '}';
     }
 }

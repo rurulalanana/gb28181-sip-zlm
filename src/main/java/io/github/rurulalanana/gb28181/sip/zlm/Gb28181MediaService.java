@@ -1,29 +1,36 @@
 package io.github.rurulalanana.gb28181.sip.zlm;
 
 import io.github.rurulalanana.gb28181.sip.Gb28181SipServer;
+import io.github.rurulalanana.gb28181.sip.cascade.CascadeEvents;
 import io.github.rurulalanana.gb28181.sip.event.InviteEvent;
 import io.github.rurulalanana.gb28181.sip.event.KeepAliveEvent;
+import io.github.rurulalanana.gb28181.sip.event.ManscdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.RegisterEvent;
+import io.github.rurulalanana.gb28181.sip.event.SdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.SipCallback;
 import io.github.rurulalanana.gb28181.sip.sdp.SdpMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+
 /**
- * GB28181 流媒体服务：把 gb28181-sip 的信令事件桥接到 ZLMediaKit 收流。
+ * GB28181 媒体服务：把 sip 模块的信令事件桥接到 ZLMediaKit 收流与分发。
  *
- * <p><b>实时点播（设备发起 INVITE）</b>：
- * <ol>
- *   <li>{@link #onInvite} 收到 INVITE → 为通道创建 ZLM RTP 服务器（独占端口）</li>
- *   <li>回复 200 OK，SDP 携带 ZLM 媒体地址 / 端口 / 平台 SSRC（{@code a=rtpmap:96 PS/90000}）</li>
- *   <li>设备向该端口推 RTP/PS → ZLM 解复用并发布为多协议流（FLV/HLS/WebRTC/RTSP/RTMP）</li>
- *   <li>BYE / 主动 stop → 释放 RTP 服务器</li>
- * </ol>
+ * <p>支持三类媒体会话：
+ * <ul>
+ *   <li><b>实时点播</b>（标准 9.2）：平台主动 {@link #play} 或设备主动 INVITE</li>
+ *   <li><b>历史回放</b>（标准 9.8）：{@link #queryRecordInfo} 检索 → {@link #playback} 回放，
+ *       支持 {@link #playbackControl} 的播放/暂停/跳转/倍速控制（INFO，附录 D）</li>
+ *   <li><b>文件下载</b>（标准 9.9）：{@link #download} 触发设备把文件推到平台收流端口</li>
+ * </ul>
  *
- * <p><b>实时点播（平台主动发起）</b>：{@link #play(String)} 先分配 RTP 服务器，
- * 再通过信令模块 {@code client().invitePlay(deviceId, sdp)} 向设备发起 INVITE。
- *
- * <p>回调运行在 SIP 协议栈线程上，本类不做阻塞操作；ZLM 调用均为本地 JNI，毫秒级返回。
+ * <p>此外把级联点播委托给 {@link CascadeForwarder}，把语音广播委托给 {@link BroadcastService}。
  */
 public class Gb28181MediaService implements SipCallback {
 
@@ -36,8 +43,15 @@ public class Gb28181MediaService implements SipCallback {
     private final RtpSessionManager sessionManager;
     private final MediaServerProperties props;
 
-    /** 信令服务器（start 后由平台装配），用于 respondInvite / invitePlay。 */
+    /** 信令服务器（start 后由平台装配），用于 respondInvite / invitePlayback 等。 */
     private volatile Gb28181SipServer sipServer;
+
+    private volatile CascadeForwarder cascadeForwarder;
+    private volatile BroadcastService broadcastService;
+    private volatile RecordingService recordingService;
+
+    /** RecordInfo 检索回调：设备编码 → 消费者。 */
+    private final Map<String, AtomicReference<Consumer<List<RecordItem>>>> recordCallbacks = new ConcurrentHashMap<>();
 
     /** 设备上下线监听者（可选）。 */
     public interface DeviceListener {
@@ -55,9 +69,20 @@ public class Gb28181MediaService implements SipCallback {
         this.props = props;
     }
 
-    /** 平台装配：注入信令服务器（提供 client）。 */
     public void attach(Gb28181SipServer sipServer) {
         this.sipServer = sipServer;
+    }
+
+    public void setCascadeForwarder(CascadeForwarder cascadeForwarder) {
+        this.cascadeForwarder = cascadeForwarder;
+    }
+
+    public void setBroadcastService(BroadcastService broadcastService) {
+        this.broadcastService = broadcastService;
+    }
+
+    public void setRecordingService(RecordingService recordingService) {
+        this.recordingService = recordingService;
     }
 
     public void setDeviceListener(DeviceListener listener) {
@@ -68,18 +93,37 @@ public class Gb28181MediaService implements SipCallback {
         return sessionManager;
     }
 
-    // ==================== SIP 回调 ====================
+    public RecordingService recordingService() {
+        return recordingService;
+    }
+
+    // ==================== INVITE：设备主动 ====================
 
     @Override
     public void onInvite(InviteEvent event) {
         if (event.getSdp() == null) {
-            log.warn("INVITE 无 SDP，拒绝: callId={} peer={}", event.getCallId(), event.getPeer());
+            log.warn("INVITE 无 SDP，拒绝: callId={}", event.getCallId());
             reject(event, SDP_NOT_ACCEPTABLE);
             return;
         }
-        if (!event.isPlay()) {
-            // 回放 / 下载需要 ZLM 侧录像检索配合，v1 仅支持实时点播
-            log.warn("暂不支持的 INVITE 类型（仅实时点播）: s={} callId={}",
+        String peerId = event.getPeer() == null ? null : event.getPeer().getDeviceId();
+
+        // 级联点播：来自已登记的级联平台，转发媒体而非自己收流
+        if (peerId != null && sipServer != null && sipServer.getCascade() != null
+                && sipServer.getCascade().getRegistry().get(peerId) != null) {
+            handleCascadeInvite(event);
+            return;
+        }
+
+        // 语音广播：s=AudioBroadcast
+        if ("AudioBroadcast".equalsIgnoreCase(event.getSdp().getSessionName())) {
+            handleBroadcastInvite(event);
+            return;
+        }
+
+        MediaType type = MediaType.ofSessionName(event.getSdp().getSessionName());
+        if (type == MediaType.REALTIME && !event.isPlay()) {
+            log.warn("暂不支持的 INVITE 类型: s={} callId={}",
                     event.getSdp().getSessionName(), event.getCallId());
             reject(event, SDP_NOT_ACCEPTABLE);
             return;
@@ -87,15 +131,14 @@ public class Gb28181MediaService implements SipCallback {
 
         String channelId = resolveChannelId(event);
         boolean tcp = isTcpTransport(event);
-        int tcpMode = tcp ? RtpSessionManager.TCP_MODE_PASSIVE : 0;
-
         try {
-            RtpSession session = sessionManager.open(channelId, event.getPeer().getDeviceId(),
-                    event.getSsrc(), tcpMode, event.getCallId());
+            String mediaUri = type == MediaType.REALTIME ? null : event.getSdp().getUri();
+            RtpSession session = sessionManager.open(channelId, peerId, event.getSsrc(),
+                    tcp ? RtpSessionManager.TCP_MODE_PASSIVE : 0, event.getCallId(), type, mediaUri);
             SdpMessage answer = buildAnswerSdp(session, tcp);
             client().respondInvite(event.getRawRequestEvent(), answer);
-            log.info("已应答 INVITE(200 OK): channel={} media={}:{} ssrc={} playUrls={}",
-                    channelId, props.getMediaIp(), session.getPort(), session.getSsrc(),
+            log.info("已应答 INVITE(200 OK): {} media={}:{} playUrls={}",
+                    session, props.getMediaIp(), session.getPort(),
                     mediaServer.playUrls(session.getStream()));
         } catch (Exception e) {
             log.error("处理 INVITE 失败: channel={} callId={}", channelId, event.getCallId(), e);
@@ -118,24 +161,143 @@ public class Gb28181MediaService implements SipCallback {
         if (session != null) {
             sessionManager.closeByCallId(event.getCallId());
             log.info("BYE 关闭会话: {}", session);
-        } else {
-            // 部分设备 BYE 的 Call-ID 与 INVITE 不一致时按通道兜底
-            String channelId = resolveChannelId(event);
-            if (sessionManager.getByChannel(channelId) != null) {
-                sessionManager.closeByChannel(channelId);
-                log.info("BYE 关闭会话(按通道兜底): channel={}", channelId);
-            }
+            return;
+        }
+        if (cascadeForwarder != null && cascadeForwarder.context(event.getCallId()) != null) {
+            cascadeForwarder.stopForward(event.getCallId());
+            return;
+        }
+        String channelId = resolveChannelId(event);
+        if (sessionManager.getByChannel(channelId) != null) {
+            sessionManager.closeByChannel(channelId);
         }
     }
 
+    /** 收到设备侧 INFO（回放控制应答等），仅记录。 */
+    @Override
+    public void onInfo(SdpEvent event) {
+        log.info("收到 INFO: callId={} u={} t={}", event.getCallId(),
+                event.getSdp() == null ? null : event.getSdp().getUri(),
+                event.getSdp() == null ? null : event.getSdp().getTime());
+    }
+
+    // ==================== 平台主动：实时 / 回放 / 下载 ====================
+
+    /** 平台主动实时点播（标准 9.2）。 */
+    public RtpSession play(String deviceId) {
+        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+                MediaType.REALTIME, null);
+        SdpMessage offer = buildAnswerSdp(session, false);
+        String callId = client().invitePlay(deviceId, offer);
+        sessionManager.bindCallId(session, callId);
+        log.info("已发起点播 INVITE: {} media={}:{} callId={}",
+                session, props.getMediaIp(), session.getPort(), callId);
+        return session;
+    }
+
+    /**
+     * 平台主动历史回放（标准 9.8）。
+     *
+     * @param deviceId 设备/通道编码
+     * @param item     {@link #queryRecordInfo} 检索到的录像段
+     */
+    public RtpSession playback(String deviceId, RecordItem item) {
+        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+                MediaType.PLAYBACK, item.getFilePath());
+        SdpMessage offer = buildPlaybackSdp(session, item);
+        String callId = client().invitePlayback(deviceId, offer);
+        sessionManager.bindCallId(session, callId);
+        log.info("已发起回放 INVITE: channel={} file={} callId={} playUrls={}",
+                deviceId, item.getFilePath(), callId, mediaServer.playUrls(session.getStream()));
+        return session;
+    }
+
+    /**
+     * 平台主动文件下载（标准 9.9）：设备把文件流推到平台收流端口。
+     *
+     * @param filePath 设备侧文件路径（来自 RecordInfo 的 FilePath）
+     */
+    public RtpSession download(String deviceId, String filePath) {
+        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+                MediaType.DOWNLOAD, filePath);
+        SdpMessage offer = buildAnswerSdp(session, false);
+        String callId = client().invite(deviceId, offer, subjectFor(deviceId));
+        sessionManager.bindCallId(session, callId);
+        log.info("已发起下载 INVITE: channel={} file={} callId={}", deviceId, filePath, callId);
+        return session;
+    }
+
+    /**
+     * 历史回放控制（标准附录 D，RFC 2976）：播放 / 暂停 / 跳转 / 倍速。
+     *
+     * @param callId 回放 INVITE 的 Call-ID
+     * @param from   跳转目标时间（SEEK 使用）
+     * @param scale  倍速（SPEED 使用，1.0 为正常）
+     */
+    public void playbackControl(String deviceId, String callId, PlaybackCommand command,
+                                Date from, float scale) {
+        SdpMessage sdp = new SdpMessage()
+                .origin(props.getPlatformId(), props.getMediaIp())
+                .uri(command.command())
+                .sessionName("Playback")
+                .realtime();
+        if (command == PlaybackCommand.SEEK && from != null) {
+            String text = RecordItem.formatTime(from);
+            sdp.time(text + " " + text);
+        }
+        if (command == PlaybackCommand.SPEED) {
+            sdp.attr("Scale: " + scale);
+        }
+        client().info(deviceId, callId, sdp);
+        log.info("发送回放控制: channel={} callId={} command={} scale={}",
+                deviceId, callId, command.command(), scale);
+    }
+
+    /** 停止某通道的点播（释放收流端口；BYE 由业务侧按需发送）。 */
+    public void stop(String deviceId) {
+        sessionManager.closeByChannel(deviceId);
+    }
+
+    public PlayUrls playUrls(String deviceId) {
+        RtpSession session = sessionManager.getByChannel(deviceId);
+        return session == null ? null : mediaServer.playUrls(session.getStream());
+    }
+
+    /**
+     * 检索设备录像（标准 9.8 RecordInfo），异步回调。
+     *
+     * @param startTime ISO 8601 {@code yyyy-MM-dd'T'HH:mm:ss}
+     * @param endTime   同上
+     */
+    public void queryRecordInfo(String deviceId, String startTime, String endTime,
+                                Consumer<List<RecordItem>> onRecords) {
+        recordCallbacks.put(deviceId, new AtomicReference<>(onRecords));
+        client().queryRecordInfo(deviceId, startTime, endTime);
+    }
+
+    @Override
+    public void onManscdpResponse(ManscdpEvent event) {
+        if (event == null || event.getManscdp() == null) {
+            return;
+        }
+        String deviceId = event.getManscdp().getDeviceId();
+        AtomicReference<Consumer<List<RecordItem>>> ref =
+                deviceId == null ? null : recordCallbacks.remove(deviceId);
+        if (ref == null || ref.get() == null) {
+            return;
+        }
+        List<RecordItem> items = RecordItem.parse(event);
+        log.info("收到录像检索结果: device={} items={}", deviceId, items.size());
+        ref.get().accept(items);
+    }
+
+    // ==================== 设备事件 ====================
+
     @Override
     public void onRegister(RegisterEvent event) {
-        if (event.isUnregistered()) {
-            log.info("设备注销: deviceId={} ip={}", event.getDeviceId(), event.getPeer().getIp());
-        } else {
-            log.info("设备注册: deviceId={} ip={} expires={}",
-                    event.getDeviceId(), event.getPeer().getIp(), event.getExpires());
-        }
+        log.info("设备{}: deviceId={} ip={} expires={}",
+                event.isUnregistered() ? "注销" : "注册",
+                event.getDeviceId(), event.getPeer().getIp(), event.getExpires());
         DeviceListener l = deviceListener;
         if (l != null) {
             l.onRegister(event);
@@ -151,37 +313,58 @@ public class Gb28181MediaService implements SipCallback {
         }
     }
 
-    // ==================== 平台主动点播 ====================
+    // ==================== 级联 / 广播 ====================
 
-    /**
-     * 平台主动向设备发起实时点播。
-     *
-     * <p>先分配 ZLM 收流端口，再用信令模块发送 INVITE（SDP 携带收流地址）。
-     * 设备应答 200 OK 后即向该端口推流。
-     *
-     * @param deviceId 设备/通道编码
-     * @return 会话（含播放地址）
-     */
-    public RtpSession play(String deviceId) {
-        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null);
-        SdpMessage offer = buildAnswerSdp(session, false);
-        String callId = client().invitePlay(deviceId, offer);
-        sessionManager.bindCallId(session, callId);
-        log.info("已发起点播 INVITE: channel={} media={}:{} callId={} playUrls={}",
-                deviceId, props.getMediaIp(), session.getPort(), callId,
-                mediaServer.playUrls(session.getStream()));
-        return session;
+    /** 级联点播：上级点播本级通道，本级负责收流并转推给上级。 */
+    private void handleCascadeInvite(InviteEvent event) {
+        CascadeForwarder forwarder = cascadeForwarder;
+        if (forwarder == null) {
+            reject(event, SDP_NOT_ACCEPTABLE);
+            return;
+        }
+        String platformId = event.getPeer().getDeviceId();
+        CascadeEvents.CascadeInvite cascadeEvent = CascadeEvents.CascadeInvite.builder()
+                .platformId(platformId)
+                .ssrc(event.getSsrc())
+                .playback(event.isPlayback())
+                .rawRequestEvent(event.getRawRequestEvent())
+                .build();
+        try {
+            CascadeForwarder.ForwardContext ctx = forwarder.onCascadeInvite(cascadeEvent, event.getCallId());
+            if (ctx == null) {
+                reject(event, SDP_NOT_ACCEPTABLE);
+                return;
+            }
+            String dstIp = event.getSdp().resolveMediaIp();
+            int dstPort = event.getMediaPort();
+            if (dstIp != null && dstPort > 0) {
+                forwarder.startForward(event.getCallId(), dstIp, dstPort);
+            }
+            client().respondInvite(event.getRawRequestEvent(),
+                    forwarder.buildUpstreamAnswer(platformId, ctx));
+            log.info("级联点播已应答: 上级={} → {}:{} 本地端口={}",
+                    platformId, dstIp, dstPort, ctx.localPort);
+        } catch (Exception e) {
+            log.error("级联点播处理失败: platform={}", platformId, e);
+            reject(event, SDP_NOT_ACCEPTABLE);
+        }
     }
 
-    /** 停止某通道的点播（释放收流端口；BYE 由业务侧按需发送）。 */
-    public void stop(String deviceId) {
-        sessionManager.closeByChannel(deviceId);
-    }
-
-    /** 某通道的播放地址（未点播返回 null）。 */
-    public PlayUrls playUrls(String deviceId) {
-        RtpSession session = sessionManager.getByChannel(deviceId);
-        return session == null ? null : mediaServer.playUrls(session.getStream());
+    /** 语音广播 INVITE（设备按标准发起）。 */
+    private void handleBroadcastInvite(InviteEvent event) {
+        BroadcastService broadcast = broadcastService;
+        String deviceId = event.getPeer() == null ? null : event.getPeer().getDeviceId();
+        if (broadcast == null || deviceId == null) {
+            reject(event, SDP_NOT_ACCEPTABLE);
+            return;
+        }
+        RtpSession session = broadcast.onBroadcastInvite(deviceId, event.getCallId());
+        if (session == null) {
+            reject(event, SDP_NOT_ACCEPTABLE);
+            return;
+        }
+        client().respondInvite(event.getRawRequestEvent(), broadcast.buildAnswer(deviceId, session));
+        log.info("语音广播已应答: device={} port={}", deviceId, session.getPort());
     }
 
     // ==================== 内部 ====================
@@ -194,18 +377,11 @@ public class Gb28181MediaService implements SipCallback {
         return server.client();
     }
 
-    /**
-     * 解析通道编码（同时作为 ZLM 流名）。
-     *
-     * <p>Subject 格式（标准 9.2）：{@code 发送者ID:接收者ID,发送者序号:接收者序号}。
-     * 设备发起 INVITE 时发送者即通道；防御性地把平台编码换成为接收者。
-     */
     String resolveChannelId(InviteEvent event) {
         String fromSubject = parseSenderId(event.getSubject());
         if (fromSubject != null && !props.getPlatformId().equals(fromSubject)) {
             return fromSubject;
         }
-        // subject 缺失或首个编码是平台本身时，尝试取接收者 / 退回来路设备编码
         String receiver = parseReceiverId(event.getSubject());
         if (receiver != null) {
             return receiver;
@@ -239,29 +415,20 @@ public class Gb28181MediaService implements SipCallback {
         return pair.substring(colon + 1).trim();
     }
 
-    /** 设备 SDP 声明 TCP 承载时走 TCP 被动模式（ZLM 监听，设备接入）。 */
     private boolean isTcpTransport(InviteEvent event) {
         String proto = event.getSdp().getMediaProto();
         return proto != null && proto.toUpperCase().contains("TCP");
     }
 
-    /**
-     * 构造 200 OK 应答 SDP（GB28181 PS over RTP）：
-     * <pre>
-     * v=0
-     * o={platformId} 0 0 IN IP4 {mediaIp}
-     * s=Play
-     * c=IN IP4 {mediaIp}
-     * t=0 0
-     * m=video {port} RTP/AVP 96
-     * a=rtpmap:96 PS/90000
-     * y={ssrc}
-     * </pre>
-     */
+    private String subjectFor(String deviceId) {
+        return deviceId + ":" + props.getPlatformId() + ",0000000001:0000000001";
+    }
+
+    /** 构造收流应答 SDP（实时 / 下载通用）：PS over RTP，{@code y=} 取会话 SSRC。 */
     SdpMessage buildAnswerSdp(RtpSession session, boolean tcp) {
         SdpMessage sdp = new SdpMessage()
                 .origin(props.getPlatformId(), props.getMediaIp())
-                .sessionName(SdpMessage.S_PLAY)
+                .sessionName(session.getType().sdpSessionName())
                 .connection(props.getMediaIp())
                 .realtime()
                 .mediaPort(session.getPort())
@@ -269,8 +436,33 @@ public class Gb28181MediaService implements SipCallback {
                 .payloadType("96")
                 .rtpmap("96", "PS")
                 .ssrc(session.getSsrc());
+        if (session.getMediaUri() != null) {
+            sdp.uri(session.getMediaUri());
+        }
         if (tcp) {
             sdp.setup("passive");
+        }
+        return sdp;
+    }
+
+    /**
+     * 构造历史回放 SDP（标准 9.8）：{@code s=Playback} + {@code u=文件路径} + {@code t=时间段}。
+     */
+    SdpMessage buildPlaybackSdp(RtpSession session, RecordItem item) {
+        SdpMessage sdp = new SdpMessage()
+                .origin(props.getPlatformId(), props.getMediaIp())
+                .sessionName(SdpMessage.S_PLAYBACK)
+                .uri(item.getFilePath())
+                .connection(props.getMediaIp())
+                .mediaPort(session.getPort())
+                .payloadType("96")
+                .rtpmap("96", "PS")
+                .ssrc(session.getSsrc());
+        String start = RecordItem.formatTime(item.getStartTime());
+        String end = RecordItem.formatTime(item.getEndTime());
+        sdp.time((start == null ? "0" : start) + " " + (end == null ? "0" : end));
+        if (item.getFileSize() > 0) {
+            sdp.filesize(item.getFileSize());
         }
         return sdp;
     }
@@ -280,6 +472,30 @@ public class Gb28181MediaService implements SipCallback {
             client().rejectInvite(event.getRawRequestEvent(), statusCode);
         } catch (Exception e) {
             log.error("拒绝 INVITE 失败: callId={} code={}", event.getCallId(), statusCode, e);
+        }
+    }
+
+    /** 回放控制命令（标准附录 D 的 {@code u=} 取值）。 */
+    public enum PlaybackCommand {
+        /** 播放/继续。 */
+        PLAY("play"),
+        /** 暂停。 */
+        PAUSE("pause"),
+        /** 跳转到指定时间。 */
+        SEEK("seek"),
+        /** 倍速（配合 {@code a=Scale:}）。 */
+        SPEED("play"),
+        /** 结束回放。 */
+        STOP("stop");
+
+        private final String command;
+
+        PlaybackCommand(String command) {
+            this.command = command;
+        }
+
+        public String command() {
+            return command;
         }
     }
 }

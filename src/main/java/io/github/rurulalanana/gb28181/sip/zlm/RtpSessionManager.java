@@ -75,6 +75,17 @@ public class RtpSessionManager {
      * @return 新会话；若该通道已有会话，先关闭旧会话
      */
     public RtpSession open(String channelId, String deviceId, String deviceSsrc, int tcpMode, String callId) {
+        return open(channelId, deviceId, deviceSsrc, tcpMode, callId, MediaType.REALTIME, null);
+    }
+
+    /**
+     * 为通道打开收流会话（实时 / 回放 / 下载共用收流机制）。
+     *
+     * @param type     会话类型，决定 SDP 的 {@code s=} 与 SSRC 历史位
+     * @param mediaUri 回放/下载的媒体标识（SDP {@code u=}）
+     */
+    public RtpSession open(String channelId, String deviceId, String deviceSsrc, int tcpMode,
+                           String callId, MediaType type, String mediaUri) {
         RtpSession old = byChannel.get(channelId);
         if (old != null) {
             log.info("通道 {} 已有会话，先关闭旧会话: {}", channelId, old);
@@ -82,7 +93,9 @@ public class RtpSessionManager {
         }
 
         ZLMApi api = ZlmMediaServer.api();
-        String ssrc = GbId.buildSsrc(channelId, ssrcSeq.getAndIncrement(), true);
+        MediaType mediaType = type == null ? MediaType.REALTIME : type;
+        // SSRC 首位：实时 0 / 历史 1（GB/T 28181 附录 G）；buildSsrc 第三个参数是 realtime
+        String ssrc = GbId.buildSsrc(channelId, ssrcSeq.getAndIncrement(), !mediaType.historical());
         String ssrcFilter = normalizeSsrc(deviceSsrc);
         int port = allocatePort();
 
@@ -95,7 +108,7 @@ public class RtpSessionManager {
         int actualPort = api.mk_rtp_server_port(handle) & 0xFFFF;
 
         RtpSession session = new RtpSession(channelId, deviceId, ssrc, deviceSsrc, tcpMode,
-                callId, handle, actualPort);
+                callId, handle, actualPort, mediaType, mediaUri);
         // detach 回调：ZLM 侧服务器被关闭/销毁时触发，只做账务清理，绝不重复 release
         final RtpSession[] holder = new RtpSession[]{session};
         Runnable detach = () -> onRtpDetached(holder[0]);
@@ -105,8 +118,8 @@ public class RtpSessionManager {
         if (callId != null) {
             byCallId.put(callId, session);
         }
-        log.info("打开收流会话: {} rtpPort={} ssrc={} filterSsrc={} tcp={}",
-                session, actualPort, ssrc, ssrcFilter, tcpMode == TCP_MODE_PASSIVE);
+        log.info("打开收流会话: {} rtpPort={} ssrc={} filterSsrc={} tcp={} mediaUri={}",
+                session, actualPort, ssrc, ssrcFilter, tcpMode == TCP_MODE_PASSIVE, mediaUri);
         SessionListener l = listener;
         if (l != null) {
             l.onSessionOpened(session);

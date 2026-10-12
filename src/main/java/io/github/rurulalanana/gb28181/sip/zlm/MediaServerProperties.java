@@ -71,6 +71,26 @@ public class MediaServerProperties {
     @Builder.Default
     private final int rtpPortRangeEnd = 0;
 
+    /** ZLM 虚拟主机名（默认虚拟主机）。 */
+    @Builder.Default
+    private final String vhost = "__defaultVhost__";
+
+    /** 平台录像根目录，按 {@code 根目录/通道编码/} 分目录存放。 */
+    @Builder.Default
+    private final String recordRoot = System.getProperty("user.dir") + "/record";
+
+    /** 平台录像单文件最大时长（秒），到点自动分段。 */
+    @Builder.Default
+    private final int recordMaxSecond = 3600;
+
+    /** ZLM 录像点播应用名（HTTP 直链播放用）。 */
+    @Builder.Default
+    private final String recordApp = "record";
+
+    /** 是否随流上下线自动开始/停止平台录像。 */
+    @Builder.Default
+    private final boolean autoRecord = false;
+
     // ==================== 内部工具 ====================
 
     /** 探测本机第一个非回环 IPv4 地址；失败时退回 127.0.0.1。 */

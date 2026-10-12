@@ -115,8 +115,75 @@ public class Gb28181MediaPlatformE2ETest {
     }
 
     @Test
-    public void 回放INVITE应被488拒绝() throws Exception {
-        Gb28181MediaPlatform platform = new Gb28181MediaPlatform(
+    public void 回放INVITE应应答且SSRC取历史位() throws Exception {
+        Gb28181MediaPlatform platform = newGb28181MediaPlatform();
+        platform.start();
+
+        Device device = new Device(CAMERA_ID, PLATFORM_ID, SIP_PORT);
+        try {
+            String sdpOffer = "v=0\r\n"
+                    + "o=" + CAMERA_ID + " 0 0 IN IP4 127.0.0.1\r\n"
+                    + "s=Playback\r\n"
+                    + "u=media/record/ch01_0001.mp4\r\n"
+                    + "c=IN IP4 127.0.0.1\r\n"
+                    + "t=2026-10-12T10:00:00 2026-10-12T11:00:00\r\n"
+                    + "m=video 40000 RTP/AVP 96\r\n"
+                    + "a=rtpmap:96 PS/90000\r\n";
+            String resp = device.invite(sdpOffer);
+            assertTrue("回放应被应答: " + firstLine(resp), resp.startsWith("SIP/2.0 200"));
+
+            String answerSdp = body(resp);
+            assertTrue("应答 SDP 应为 Playback: " + answerSdp, answerSdp.contains("s=Playback"));
+            assertTrue("应答 SDP 应回显媒体标识 u=: " + answerSdp,
+                    answerSdp.contains("u=media/record/ch01_0001.mp4"));
+            // SSRC 首位：0=实时 1=历史（GB/T 28181 附录 G）
+            java.util.regex.Matcher y = java.util.regex.Pattern.compile("y=(\\d{10})").matcher(answerSdp);
+            assertTrue("应答 SDP 应含 10 位 SSRC: " + answerSdp, y.find());
+            assertEquals("回放 SSRC 首位应为历史位 1", '1', y.group(1).charAt(0));
+
+            RtpSession session = platform.sessionManager().getByChannel(CAMERA_ID);
+            assertNotNull("回放会话应建立", session);
+            assertEquals(MediaType.PLAYBACK, session.getType());
+            assertEquals("media/record/ch01_0001.mp4", session.getMediaUri());
+        } finally {
+            device.close();
+            platform.stop();
+        }
+    }
+
+    @Test
+    public void 下载INVITE应应答且携带u行() throws Exception {
+        Gb28181MediaPlatform platform = newGb28181MediaPlatform();
+        platform.start();
+
+        Device device = new Device(CAMERA_ID, PLATFORM_ID, SIP_PORT);
+        try {
+            String sdpOffer = "v=0\r\n"
+                    + "o=" + CAMERA_ID + " 0 0 IN IP4 127.0.0.1\r\n"
+                    + "s=Download\r\n"
+                    + "u=media/record/ch01_0001.mp4\r\n"
+                    + "c=IN IP4 127.0.0.1\r\n"
+                    + "t=0 0\r\n"
+                    + "m=video 40000 RTP/AVP 96\r\n"
+                    + "a=rtpmap:96 PS/90000\r\n";
+            String resp = device.invite(sdpOffer);
+            assertTrue("下载应被应答: " + firstLine(resp), resp.startsWith("SIP/2.0 200"));
+            String answerSdp = body(resp);
+            assertTrue("应答 SDP 应为 Download: " + answerSdp, answerSdp.contains("s=Download"));
+            assertTrue("应答 SDP 应携带 u= 文件路径: " + answerSdp,
+                    answerSdp.contains("u=media/record/ch01_0001.mp4"));
+
+            RtpSession session = platform.sessionManager().getByChannel(CAMERA_ID);
+            assertNotNull("下载会话应建立", session);
+            assertEquals(MediaType.DOWNLOAD, session.getType());
+        } finally {
+            device.close();
+            platform.stop();
+        }
+    }
+
+    private Gb28181MediaPlatform newGb28181MediaPlatform() {
+        return new Gb28181MediaPlatform(
                 MediaServerProperties.builder()
                         .platformId(PLATFORM_ID)
                         .sipHost("127.0.0.1")
@@ -127,24 +194,6 @@ public class Gb28181MediaPlatformE2ETest {
                         .rtspPort(15556)
                         .rtcPort(18002)
                         .build());
-        platform.start();
-
-        Device device = new Device(CAMERA_ID, PLATFORM_ID, SIP_PORT);
-        try {
-            String sdpOffer = "v=0\r\n"
-                    + "o=" + CAMERA_ID + " 0 0 IN IP4 127.0.0.1\r\n"
-                    + "s=Playback\r\n"
-                    + "c=IN IP4 127.0.0.1\r\n"
-                    + "t=0 0\r\n"
-                    + "m=video 40000 RTP/AVP 96\r\n"
-                    + "a=rtpmap:96 PS/90000\r\n";
-            String resp = device.invite(sdpOffer);
-            assertTrue("回放应被 488 拒绝: " + firstLine(resp), resp.startsWith("SIP/2.0 488"));
-            assertTrue("不应创建会话", platform.sessionManager().sessionCount() == 0);
-        } finally {
-            device.close();
-            platform.stop();
-        }
     }
 
     // ==================== 设备模拟器 ====================

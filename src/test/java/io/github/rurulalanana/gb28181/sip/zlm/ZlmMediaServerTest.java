@@ -6,6 +6,7 @@ import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -94,5 +95,45 @@ public class ZlmMediaServerTest {
         assertTrue(server.isStarted());
         assertTrue(server.getRtmpPort() == 0);
         server.stop();
+    }
+
+    /** 录制 API：流不存在时 ZLM 挂起任务返回 0，能正确注册/停止，不崩溃。 */
+    @Test
+    public void 录制与转推句柄应可用() {
+        MediaServerProperties props = MediaServerProperties.builder()
+                .mediaIp("127.0.0.1")
+                .httpPort(HTTP_PORT)
+                .rtmpPort(-1).rtspPort(-1).rtcPort(-1)
+                .vhost("__defaultVhost__")
+                .recordRoot(System.getProperty("java.io.tmpdir") + "/gb28181-rec-test")
+                .build();
+        ZlmMediaServer server = new ZlmMediaServer(props);
+        server.start();
+        try {
+            RecordingService recording = new RecordingService(server, props);
+            Recording rec = recording.startRecording("rec-cam-1");
+            assertNotNull("应返回录像条目", rec);
+            assertTrue("录制任务应处于进行中", recording.isRecording("rec-cam-1"));
+            assertEquals("录像条目应索引在通道下", 1, recording.recordings("rec-cam-1").size());
+
+            // 检索：按通道与时间窗
+            assertEquals("按通道检索应命中", 1,
+                    recording.search("rec-cam-1", System.currentTimeMillis() - 60000L,
+                            System.currentTimeMillis() + 60000L).size());
+            assertEquals("按其它通道检索应为空", 0, recording.search("other-cam", null, null).size());
+
+            Recording closed = recording.stopRecording("rec-cam-1");
+            assertNotNull("停止应返回条目", closed);
+            assertTrue("停止后状态应为 CLOSED", Recording.CLOSED.equals(closed.getStatus()));
+            assertTrue(!recording.isRecording("rec-cam-1"));
+
+            // 转推句柄（级联/对讲下行用）：MK_MEDIA 可创建与释放
+            com.aizuda.zlm4j.structure.MK_MEDIA media = ZlmMediaServer.api()
+                    .mk_media_create("__defaultVhost__", "rtp", "rec-cam-1", 1.0f, 1, 0);
+            assertNotNull("MK_MEDIA 应创建成功", media);
+            ZlmMediaServer.api().mk_media_release(media);
+        } finally {
+            server.stop();
+        }
     }
 }

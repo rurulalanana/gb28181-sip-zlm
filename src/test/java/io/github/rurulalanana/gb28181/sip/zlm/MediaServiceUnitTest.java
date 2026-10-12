@@ -139,7 +139,11 @@ public class MediaServiceUnitTest {
     }
 
     private RtpSession fakeSession(int port, String ssrc) {
+        return fakeSession(port, ssrc, MediaType.REALTIME, null);
+    }
+
+    private RtpSession fakeSession(int port, String ssrc, MediaType type, String mediaUri) {
         return new RtpSession(CAMERA_ID, CAMERA_ID, ssrc, "1234567890", 0,
-                "test-call-id", null, port);
+                "test-call-id", null, port, type, mediaUri);
     }
 }

@@ -44,7 +44,7 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
-    <sip.module.version>1.0.1</sip.module.version>
+    <sip.module.version>1.0.2</sip.module.version>
     <zlm4j.version>1.12.0</zlm4j.version>
     <slf4j.version>1.7.36</slf4j.version>
     <junit.version>4.13.2</junit.version>

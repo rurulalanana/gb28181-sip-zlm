@@ -17,7 +17,9 @@ GB28181 **流媒体服务**：基于 [`gb28181-sip`](https://central.sonatype.co
 </dependency>
 ```
 
-> 依赖 `gb28181-sip` **1.0.1+**（1.0.0 的 `respondInvite` 在 jain-sip 1.2.344 下会静默丢弃应答）。
+> 依赖 `gb28181-sip` **1.0.2+**：
+> - 1.0.0 的 `respondInvite` 在 jain-sip 1.2.344 下会静默丢弃应答（ServerTransaction 恒为 null 且 200 OK 缺 Contact 头）
+> - 1.0.2 起补充了回放控制所需的 `client.info(deviceId, callId, sdp)`（INFO 会话内请求）
 
 ## 快速开始
 
@@ -42,7 +44,74 @@ PlayUrls urls = platform.mediaService().playUrls("34020000001320000001");
 platform.stop();  // 或 try-with-resources（实现 AutoCloseable）
 ```
 
+## 媒体能力总览
+
+| 能力 | 状态 | 入口 |
+|---|---|---|
+| 实时点播（平台主动 / 设备主动 INVITE） | ✅ | `play(deviceId)` / 自动应答 |
+| 历史回放（标准 9.8） | ✅ | `queryRecordInfo()` → `playback(deviceId, item)` |
+| 回放控制：播放/暂停/跳转/倍速（附录 D，INFO） | ✅ | `playbackControl(deviceId, callId, PLAYBACKCommand, ...)` |
+| 文件下载（标准 9.9） | ✅ | `download(deviceId, filePath)` |
+| 平台侧录像（实时流录 MP4）+ 索引检索 + 点播 | ✅ | `recordingService()` |
+| 级联媒体转发（第 8 章媒体面） | ✅ | `cascadeForwarder()` |
+| 语音广播上行 + 对讲下行 | ⚠️ 单向 | `broadcastService()`（ZLM C API 无 talk，无法真正双向） |
+| 平台录像索引持久化（落库） | ⚠️ 内存 | 索引在内存，重启丢失，可自行落库 |
+
 ## 工作流程
+
+### 历史回放
+
+```java
+// 1) 检索设备录像（标准 9.8）
+mediaService.queryRecordInfo("34020000001320000001",
+        "2026-10-12T00:00:00", "2026-10-13T00:00:00",
+        items -> {
+            if (items.isEmpty()) return;
+            // 2) 发起回放（SDP 自动带 u=文件路径、t=时间段、历史位 SSRC）
+            RtpSession session = mediaService.playback("34020000001320000001", items.get(0));
+            // 3) 回放控制（INFO，标准附录 D）
+            mediaService.playbackControl("34020000001320000001", callIdOf(session),
+                    Gb28181MediaService.PlaybackCommand.PAUSE, null, 1.0f);
+            mediaService.playbackControl("34020000001320000001", callIdOf(session),
+                    Gb28181MediaService.PlaybackCommand.SEEK, new Date(), 1.0f);
+            mediaService.playbackControl("34020000001320000001", callIdOf(session),
+                    Gb28181MediaService.PlaybackCommand.SPEED, null, 2.0f);
+        });
+```
+
+> 回放的收流与播放地址与实时完全一致（ZLM 自动转协议），只是 SDP 的 `s=Playback`、
+> `u=` 与历史位 SSRC（首位 1）。
+
+### 平台侧录像
+
+```java
+RecordingService rs = platform.recordingService();
+rs.setAutoRecord(true);                       // 随流上下线自动录
+rs.startRecording("34020000001320000001");     // 或手动
+List<Recording> list = rs.search("34020000001320000001", fromMillis, toMillis);
+PlayUrls urls = rs.playUrl(list.get(0));       // 拉入 ZLM 转协议点播
+String fileUrl = list.get(0).getFileUrl();     // 或直接下载录像文件
+```
+
+录像落盘目录 `recordRoot/<通道编码>/<通道>_<时间戳>.mp4`，单文件时长由 `recordMaxSecond` 控制。
+
+### 级联媒体转发
+
+上级平台点播本级通道时自动触发：本地收下级设备的流 → ZLM 转 PS/RTP 发往上级 →
+用本地端口回 200 OK。结束（BYE）自动停转发并释放收流端口。
+
+### 语音广播 / 对讲
+
+```java
+BroadcastService bs = platform.broadcastService();
+// 上行：设备发 INVITE(s=AudioBroadcast) 自动应答并收流
+PlayUrls urls = bs.playUrls(deviceId);          // 前端收听
+// 下行：把平台侧流以 PS 发给设备
+bs.startDownlink("rtp", "local-stream", deviceIp, devicePort, ssrc);
+```
+
+> **限制**：ZLMediaKit 的 C API 未暴露 `startSendRtpTalk`，无法真正「边收边发」的双向对讲，
+> 只能上行收流、下行发送分别进行。
 
 ### 实时点播（平台主动）
 
@@ -101,6 +170,11 @@ RTP 数据超时（默认 15s）只会让**流下线**，端口保留等待设�
 | `rtmpPort` / `rtspPort` / `rtcPort` | `1935` / `8554` / `8000` | 各协议端口，`-1` 关闭 |
 | `app` | `rtp` | ZLM 应用名（播放 URL 第一段） |
 | `rtpPortRangeStart/End` | `0` / `0` | RTP 固定端口范围；0 = 随机分配 |
+| `vhost` | `__defaultVhost__` | ZLM 虚拟主机 |
+| `recordRoot` | `${user.dir}/record` | 平台录像根目录 |
+| `recordMaxSecond` | `3600` | 单文件录像时长上限（秒） |
+| `recordApp` | `record` | 录像 HTTP 直链应用名 |
+| `autoRecord` | `false` | 随流自动录像 |
 
 ## 测试
 
@@ -111,15 +185,18 @@ mvn test
 | 测试 | 覆盖 |
 |---|---|
 | `MediaServiceUnitTest` | Subject 解析、SDP 应答构造、SSRC 归一化、播放地址（纯逻辑，无原生依赖） |
-| `ZlmMediaServerTest` | ZLM 启停、RTP 服务器创建/释放（UDP/TCP）、端口语义 |
-| `Gb28181MediaPlatformE2ETest` | 端到端：裸 SIP 设备模拟器 → REGISTER → INVITE → 200 OK（SDP 端口与 ZLM 会话一致）→ ACK → BYE → 会话释放；回放 INVITE 回 488 |
+| `RecordPlaybackUnitTest` | RecordInfo XML 解析、回放/下载 SDP（历史位 SSRC、u=、t=）、会话类型映射 |
+| `ZlmMediaServerTest` | ZLM 启停、RTP 服务器创建/释放（UDP/TCP）、录制与转推句柄、端口语义 |
+| `Gb28181MediaPlatformE2ETest` | 端到端：裸 SIP 设备模拟器 → REGISTER → INVITE(Play) → 200 OK（SDP 端口与 ZLM 会话一致）→ ACK → BYE → 会话释放；回放 INVITE 校验历史位 SSRC；下载 INVITE 校验 u= |
 
 > 原生测试在无匹配平台原生库时自动跳过（JUnit `Assume`）。
 
 ## 已知限制
 
-- **未做真实 RTP/PS 媒体流验证**：E2E 验证到信令协商 + RTP 服务器生命周期；完整媒体链路（设备推流 → 画面出流）需要真实 GB28181 设备（或 EasyGBD 模拟）验证
-- 回放 / 下载 / 语音广播未实现（488 拒绝）
+- **未做真实 RTP/PS 媒体流验证**：E2E 验证到信令协商 + RTP 服务器生命周期 + 录制/转推句柄可用性；完整媒体链路（设备推流 → 画面出流 → 出录像文件）需要真实 GB28181 设备（或 EasyGBD 模拟）验证
+- **对讲非双向**：ZLM C API 无 talk 能力，只能上行收 + 下行发
+- **录像索引在内存**：重启丢失，多实例不共享，需要持久化请自行落库（`RecordingService` 可作为数据源）
+- **级联转发为 UDP 单向**：`startSendRtp` 走 UDP，上级要求 TCP 主动连接需上层另行处理
 - ZLMediaKit 的 HTTP RESTful API 在嵌入模式下不可用，业务查询请用事件回调或自行扩展
 
 ## License
