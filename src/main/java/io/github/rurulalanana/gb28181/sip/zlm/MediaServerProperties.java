@@ -40,23 +40,27 @@ public class MediaServerProperties {
     @Builder.Default
     private final String sipHost = "0.0.0.0";
 
-    /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 随机端口。 */
+    /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 自动选空闲端口。 */
     @Builder.Default
     private final int httpPort = 8080;
 
-    /** RTMP 服务端口。0 = 随机端口；-1 = 不启动。 */
+    /** RTMP 服务端口。0 = 自动选空闲端口；-1 = 不启动。 */
     @Builder.Default
     private final int rtmpPort = 1935;
 
-    /** RTSP 服务端口。0 = 随机端口；-1 = 不启动。 */
+    /** RTSP 服务端口。0 = 自动选空闲端口；-1 = 不启动。 */
     @Builder.Default
     private final int rtspPort = 8554;
 
-    /** WebRTC 服务端口。0 = 随机端口；-1 = 不启动。 */
+    /** WebRTC 服务端口。0 = 自动选空闲端口；-1 = 不启动。 */
     @Builder.Default
     private final int rtcPort = 8000;
 
-    /** ZLM 流应用名（播放 URL 路径第一段）。国标生态惯例为 {@code rtp}。 */
+    /**
+     * ZLM 流应用名（播放 URL 路径第一段）。国标生态惯例为 {@code rtp}。
+     * <p>注意：嵌入式模式下 ZLM 未注册 HTTP 播放路由，{@code app/stream} 主要用于
+     * WebRTC、RTSP、RTMP 与录像索引。
+     */
     @Builder.Default
     private final String app = "rtp";
 
@@ -90,6 +94,23 @@ public class MediaServerProperties {
     /** 是否随流上下线自动开始/停止平台录像。 */
     @Builder.Default
     private final boolean autoRecord = false;
+
+    /**
+     * ZLM 的 MPEG-PS 负载类型（{@code rtp.ps_pt}）。0 = 用 ZLM 默认（96，国标）。
+     * 若要用 ffmpeg 推裸 H264 测试流，可把 PS 改到 98 并把 H264 设为 96。
+     */
+    @Builder.Default
+    private final int psPayloadType = 0;
+
+    /**
+     * ZLM 的 H264 负载类型（{@code rtp.h264_pt}）。0 = 用 ZLM 默认。
+     */
+    @Builder.Default
+    private final int h264PayloadType = 0;
+
+    /** ZLM 的 H265 负载类型（{@code rtp.h265_pt}）。0 = 用 ZLM 默认。 */
+    @Builder.Default
+    private final int h265PayloadType = 0;
 
     // ==================== 内部工具 ====================
 

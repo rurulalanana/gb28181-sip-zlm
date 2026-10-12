@@ -35,6 +35,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
     private RecordingService recordingService;
     private CascadeForwarder cascadeForwarder;
     private BroadcastService broadcastService;
+    private WebRtcService webRtcService;
     private Gb28181SipServer sipServer;
 
     public Gb28181MediaPlatform(MediaServerProperties props) {
@@ -71,6 +72,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         // 3. 级联转发 / 语音广播 + 信令服务（回调 = 流媒体服务）
         cascadeForwarder = new CascadeForwarder(mediaServer, sessionManager, props);
         broadcastService = new BroadcastService(mediaServer, sessionManager, props);
+        webRtcService = new WebRtcService(mediaServer);
         mediaService = new Gb28181MediaService(mediaServer, sessionManager, props);
         mediaService.setCascadeForwarder(cascadeForwarder);
         mediaService.setBroadcastService(broadcastService);
@@ -117,6 +119,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         recordingService = null;
         cascadeForwarder = null;
         broadcastService = null;
+        webRtcService = null;
         sipServer = null;
         log.info("GB28181 流媒体平台已停止");
     }
@@ -150,6 +153,11 @@ public class Gb28181MediaPlatform implements AutoCloseable {
     /** 语音广播 / 对讲。 */
     public BroadcastService broadcastService() {
         return broadcastService;
+    }
+
+    /** WebRTC 播放信令（嵌入式模式下浏览器出画面的唯一通路）。 */
+    public WebRtcService webRtcService() {
+        return webRtcService;
     }
 
     /** 信令客户端（主动查询目录 / 点播 / PTZ 控制等）。 */

@@ -131,8 +131,16 @@ public class RtpSessionManager {
     public void closeByChannel(String channelId) {
         RtpSession session = byChannel.remove(channelId);
         if (session != null) {
-            byCallId.remove(session.getCallId());
+            unbindCallId(session);
             release(session);
+        }
+    }
+
+    /** 解绑 Call-ID 索引（平台主动发起的会话 Call-ID 可能尚未回填，不可传 null）。 */
+    private void unbindCallId(RtpSession session) {
+        String callId = session.getCallId();
+        if (callId != null) {
+            byCallId.remove(callId);
         }
     }
 
@@ -218,9 +226,7 @@ public class RtpSessionManager {
         }
         log.info("RTP 服务器 detach: {}", session);
         byChannel.remove(session.getChannelId());
-        if (session.getCallId() != null) {
-            byCallId.remove(session.getCallId());
-        }
+        unbindCallId(session);
         session.setState(RtpSession.CLOSED);
         SessionListener l = listener;
         if (l != null) {

@@ -68,6 +68,16 @@ public class RecordItem {
         this.fileSize = fileSize;
     }
 
+    /**
+     * 以已知文件路径构造录像项（设备未提供完整检索结果时使用）。
+     *
+     * @param deviceId 设备/通道编码
+     * @param filePath 设备侧文件路径（回放 INVITE 的 {@code u=}）
+     */
+    public static RecordItem ofFilePath(String deviceId, String filePath) {
+        return new RecordItem(deviceId, filePath, filePath, null, null, null, "manual", 0L);
+    }
+
     /** 从 {@code <Item>} 元素解析。 */
     static RecordItem from(Element item) {
         return new RecordItem(
