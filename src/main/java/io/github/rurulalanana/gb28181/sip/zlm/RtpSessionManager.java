@@ -38,6 +38,8 @@ public class RtpSessionManager {
     private final Map<String, RtpSession> byChannel = new ConcurrentHashMap<>();
     private final Map<String, RtpSession> byCallId = new ConcurrentHashMap<>();
     private final AtomicInteger ssrcSeq = new AtomicInteger(1);
+    /** ZLM 流名序号（ZLM 注册为 <channelId>/<序号>）。 */
+    private final AtomicInteger streamSeq = new AtomicInteger(0);
     private final AtomicInteger nextPort = new AtomicInteger(0);
 
     /** 会话事件监听者（业务侧）。 */
@@ -100,6 +102,7 @@ public class RtpSessionManager {
         // SSRC 首位：实时 0 / 历史 1（GB/T 28181 附录 G）；buildSsrc 第三个参数是 realtime
         String ssrc = GbId.buildSsrc(channelId, ssrcSeq.getAndIncrement(), !mediaType.historical());
         String ssrcFilter = normalizeSsrc(deviceSsrc);
+        int streamIndex = streamSeq.getAndIncrement();
         int port = allocatePort();
 
         MK_RTP_SERVER handle = api.mk_rtp_server_create2((short) port, tcpMode,
@@ -111,7 +114,7 @@ public class RtpSessionManager {
         int actualPort = api.mk_rtp_server_port(handle) & 0xFFFF;
 
         RtpSession session = new RtpSession(channelId, deviceId, ssrc, deviceSsrc, tcpMode,
-                callId, handle, actualPort, mediaType, mediaUri);
+                callId, handle, actualPort, mediaType, mediaUri, streamIndex);
         // detach 回调：ZLM 侧服务器被关闭/销毁时触发，只做账务清理，绝不重复 release
         final RtpSession[] holder = new RtpSession[]{session};
         Runnable detach = () -> onRtpDetached(holder[0]);
@@ -195,11 +198,32 @@ public class RtpSessionManager {
     // ==================== ZLM 事件接入 ====================
 
     /** 流上线（on_mk_media_publish / changed(1)）。 */
+    /**
+     * 按 ZLM 回调的 stream 名查找会话。
+     *
+     * <p>ZLM 注册的流名为 {@code <channelId>/<序号>}（如
+     * {@code 34020000001310000001/0}），而通道表以裸 channelId 为键，
+     * 故需剥离序号后再查；同时兼容不带序号的版本。
+     */
+    private RtpSession findByStream(String stream) {
+        if (stream == null) {
+            return null;
+        }
+        int slash = stream.lastIndexOf('/');
+        if (slash > 0) {
+            RtpSession s = byChannel.get(stream.substring(0, slash));
+            if (s != null) {
+                return s;
+            }
+        }
+        return byChannel.get(stream);
+    }
+
     public void onStreamOnline(String app, String stream) {
         if (!props.getApp().equals(app)) {
             return;
         }
-        RtpSession session = byChannel.get(stream);
+        RtpSession session = findByStream(stream);
         if (session != null && !RtpSession.CLOSED.equals(session.getState())) {
             session.setState(RtpSession.ONLINE);
             log.info("流上线: {} app={}", stream, app);
@@ -215,7 +239,7 @@ public class RtpSessionManager {
         if (!props.getApp().equals(app)) {
             return;
         }
-        RtpSession session = byChannel.get(stream);
+        RtpSession session = findByStream(stream);
         if (session != null && RtpSession.ONLINE.equals(session.getState())) {
             session.setState(RtpSession.NEGOTIATING);
             log.info("流下线（RTP 端口 {} 保留等待恢复）: app={}", session.getPort(), app);

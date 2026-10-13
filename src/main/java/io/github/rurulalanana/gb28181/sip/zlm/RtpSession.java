@@ -23,6 +23,9 @@ public class RtpSession {
 
     /** 通道编码（GB28181 DeviceID，同时作为 ZLM 流名）。 */
     private final String channelId;
+
+    /** ZLM RTP 会话序号（同一通道多次点播时递增）。 */
+    private final int streamIndex;
     /** 设备编码（SIP 层设备 ID，可能与通道相同）。 */
     private final String deviceId;
     /** 平台侧 SSRC（SDP {@code y=} 行，按设备编码生成）。 */
@@ -49,7 +52,14 @@ public class RtpSession {
     public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
                       int tcpMode, String callId, MK_RTP_SERVER handle, int port,
                       MediaType type, String mediaUri) {
+        this(channelId, deviceId, ssrc, deviceSsrc, tcpMode, callId, handle, port, type, mediaUri, 0);
+    }
+
+    public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
+                      int tcpMode, String callId, MK_RTP_SERVER handle, int port,
+                      MediaType type, String mediaUri, int streamIndex) {
         this.channelId = channelId;
+        this.streamIndex = streamIndex;
         this.deviceId = deviceId;
         this.ssrc = ssrc;
         this.deviceSsrc = deviceSsrc;
@@ -114,8 +124,21 @@ public class RtpSession {
         return createdAt;
     }
 
-    /** ZLM 流名（GB28181 场景 = 通道编码）。 */
+    /**
+     * ZLM 流名（GB28181 场景）。
+     *
+     * <p>注意：ZLMediaKit 的 {@code mk_rtp_server_create2} 会把 RTP 会话
+     * 注册为 {@code <channelId>/<序号>}（实测注册日志为
+     * {@code rtsp://__defaultVhost__/34020000001310000001/0}），
+     * 而非传入的裸 channelId。播放地址必须用本方法拼出的真实流名，
+     * 否则会出现「媒体已注册但按裸 channelId 访问 404」。
+     */
     public String getStream() {
+        return channelId + "/" + streamIndex;
+    }
+
+    /** 裸通道编码（用于按通道查会话，不是 ZLM 流名）。 */
+    public String getChannelIdForLookup() {
         return channelId;
     }
 
