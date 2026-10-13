@@ -37,9 +37,17 @@ public class RtpSessionManager {
 
     private final Map<String, RtpSession> byChannel = new ConcurrentHashMap<>();
     private final Map<String, RtpSession> byCallId = new ConcurrentHashMap<>();
+    /**
+     * 「流上线事件先于会话登记到达」的流名暂存。
+     *
+     * <p>{@code mk_rtp_server_create2} 一返回，RTP 服务器就开始监听，设备可能立刻
+     * 推流并触发 ZLM 的流注册事件——而此时 {@link #byChannel} 还没 put 进会话，
+     * {@link #findByStream} 查不到，事件会被丢掉，会话就永远停在 NEGOTIATING。
+     * 先记在这里，等会话登记时补一次上线。
+     */
+    private final Map<String, Boolean> pendingOnline = new ConcurrentHashMap<>();
     private final AtomicInteger ssrcSeq = new AtomicInteger(1);
     /** ZLM 流名序号（ZLM 注册为 <channelId>/<序号>）。 */
-    private final AtomicInteger streamSeq = new AtomicInteger(0);
     private final AtomicInteger nextPort = new AtomicInteger(0);
 
     /** 会话事件监听者（业务侧）。 */
@@ -102,7 +110,6 @@ public class RtpSessionManager {
         // SSRC 首位：实时 0 / 历史 1（GB/T 28181 附录 G）；buildSsrc 第三个参数是 realtime
         String ssrc = GbId.buildSsrc(channelId, ssrcSeq.getAndIncrement(), !mediaType.historical());
         String ssrcFilter = normalizeSsrc(deviceSsrc);
-        int streamIndex = streamSeq.getAndIncrement();
         int port = allocatePort();
 
         MK_RTP_SERVER handle = api.mk_rtp_server_create2((short) port, tcpMode,
@@ -114,7 +121,7 @@ public class RtpSessionManager {
         int actualPort = api.mk_rtp_server_port(handle) & 0xFFFF;
 
         RtpSession session = new RtpSession(channelId, deviceId, ssrc, deviceSsrc, tcpMode,
-                callId, handle, actualPort, mediaType, mediaUri, streamIndex);
+                callId, handle, actualPort, mediaType, mediaUri);
         // detach 回调：ZLM 侧服务器被关闭/销毁时触发，只做账务清理，绝不重复 release
         final RtpSession[] holder = new RtpSession[]{session};
         Runnable detach = () -> onRtpDetached(holder[0]);
@@ -126,6 +133,11 @@ public class RtpSessionManager {
         }
         log.info("打开收流会话: {} rtpPort={} ssrc={} filterSsrc={} tcp={} mediaUri={}",
                 session, actualPort, ssrc, ssrcFilter, tcpMode == TCP_MODE_PASSIVE, mediaUri);
+        // 补一次「事件先于会话登记到达」的流上线（见 pendingOnline 注释）
+        if (pendingOnline.remove(session.getChannelId()) != null) {
+            log.info("流上线事件先于会话登记到达，现补记上线: {}", session.getChannelId());
+            onStreamOnline(props.getApp(), session.getStream());
+        }
         SessionListener l = listener;
         if (l != null) {
             l.onSessionOpened(session);
@@ -160,7 +172,9 @@ public class RtpSessionManager {
     public void closeByCallId(String callId) {
         RtpSession session = byCallId.remove(callId);
         if (session != null) {
-            byChannel.remove(session.getChannelId());
+            // 同 closeByChannel：必须条件删除。通道上可能已换成新会话，
+            // 无条件 remove 会把新会话一并摘掉，后续 point 会报「设备未注册」
+            byChannel.remove(session.getChannelId(), session);
             release(session);
         }
     }
@@ -176,9 +190,16 @@ public class RtpSessionManager {
         return byChannel.get(channelId);
     }
 
-    /** 平台主动点播时 INVITE 发出后回填 Call-ID，使 BYE 能按 Call-ID 关闭。 */
+    /**
+     * 平台主动点播时 INVITE 发出后回填 Call-ID，使 BYE 能按 Call-ID 关闭。
+     *
+     * <p>回填必须落到会话对象本身（{@link RtpSession#setCallId}），不能只写索引：
+     * 无人观看关流读的是 {@code session.getCallId()}，只写索引会让它恒为 null，
+     * 表现为「无人观看不关流」；同时 {@link #unbindCallId} 也摘不掉索引条目。
+     */
     public void bindCallId(RtpSession session, String callId) {
-        if (callId != null) {
+        if (callId != null && session != null) {
+            session.setCallId(callId);
             byCallId.put(callId, session);
         }
     }
@@ -206,50 +227,107 @@ public class RtpSessionManager {
 
     /** 流上线（on_mk_media_publish / changed(1)）。 */
     /**
-     * 按 ZLM 回调的 stream 名查找会话。
+     * 按 ZLM 回调的 (app, stream) 查找会话。
      *
-     * <p>ZLM 注册的流名为 {@code <channelId>/<序号>}（如
-     * {@code 34020000001310000001/0}），而通道表以裸 channelId 为键，
-     * 故需剥离序号后再查；同时兼容不带序号的版本。
+     * <p>ZLM 上报的流标识与建流参数有关，存在两种布局，都要兼容：
+     * <ul>
+     *   <li>{@code app=rtp, stream=<channelId>/<序号>} —— ZLM 自身 rtp 模块的布局</li>
+     *   <li>{@code app=<channelId>, stream=<序号>} ——
+     *       {@code mk_rtp_server_create2} 的实际布局（日志里可见
+     *       {@code rtp://rtp/3402.../0} 与 {@code app=3402..., stream=0} 两种写法）</li>
+     * </ul>
+     * 只认一种会导致事件全部落空、会话永远停在 NEGOTIATING。
      */
-    private RtpSession findByStream(String stream) {
+    private RtpSession findByStream(String app, String stream) {
         if (stream == null) {
             return null;
         }
+        // 布局一：stream = <channelId>/<序号>
         int slash = stream.lastIndexOf('/');
         if (slash > 0) {
             RtpSession s = byChannel.get(stream.substring(0, slash));
-            if (s != null) {
+            // 校验拿到的是否就是 ZLM 上报的这个流（重复点播后旧流下线时可能上报已关闭会话）
+            if (s != null && stream.equals(s.getStream())
+                    && !RtpSession.CLOSED.equals(s.getState())) {
                 return s;
             }
         }
+        // 布局二：app = <channelId>
+        if (app != null && !props.getApp().equals(app)) {
+            RtpSession s = byChannel.get(app);
+            if (s != null && !RtpSession.CLOSED.equals(s.getState())) {
+                return s;
+            }
+        }
+        // 兜底：stream 本身就是 channelId
         return byChannel.get(stream);
     }
 
+    /**
+     * 事件里能确定的目标通道（用于 {@link #pendingOnline} 匹配）。
+     *
+     * <p>与 {@link #findByStream} 的两种布局对应，最终都归一成 channelId。
+     */
+    private String channelKeyOf(String app, String stream) {
+        if (stream != null) {
+            int slash = stream.lastIndexOf('/');
+            if (slash > 0) {
+                return stream.substring(0, slash);
+            }
+        }
+        if (app != null && !app.isBlank() && !props.getApp().equals(app)) {
+            return app;
+        }
+        return stream;
+    }
+
+    /**
+     * 按 ZLM 回调的 (app, stream) 定位会话（公开版，供无人观看等外部回调使用）。
+     *
+     * @return 匹配到的会话；无法归属时返回 {@code null}
+     */
+    public RtpSession resolve(String app, String stream) {
+        return findByStream(app, stream);
+    }
+
     public void onStreamOnline(String app, String stream) {
-        if (!props.getApp().equals(app)) {
+        RtpSession session = findByStream(app, stream);
+        if (session == null) {
+            // 事件先于会话登记到达：暂存，等 open() 登记会话时补一次上线
+            String key = channelKeyOf(app, stream);
+            if (key != null) {
+                pendingOnline.put(key, Boolean.TRUE);
+                log.debug("流上线事件暂存（会话尚未登记）: app={} stream={} key={}", app, stream, key);
+            }
             return;
         }
-        RtpSession session = findByStream(stream);
-        if (session != null && !RtpSession.CLOSED.equals(session.getState())) {
-            session.setState(RtpSession.ONLINE);
-            log.info("流上线: {} app={}", stream, app);
-            SessionListener l = listener;
-            if (l != null) {
-                l.onSessionOnline(session);
-            }
+        // ZLM 对同一个源会按协议各报一次（fmp4/rtmp/rtsp/ts/hls），
+        // 只在「非 ONLINE → ONLINE」这一次真正变化时回调，避免重复落库与刷屏
+        if (RtpSession.ONLINE.equals(session.getState())
+                || RtpSession.CLOSED.equals(session.getState())) {
+            return;
+        }
+        session.setState(RtpSession.ONLINE);
+        log.info("流上线: app={} stream={} channel={}", app, stream, session.getChannelId());
+        SessionListener l = listener;
+        if (l != null) {
+            l.onSessionOnline(session);
         }
     }
 
     /** 流下线（on_mk_media_changed(0)）。端口保留，等待设备恢复。 */
     public void onStreamOffline(String app, String stream) {
-        if (!props.getApp().equals(app)) {
-            return;
+        // 下线事件与暂存的上线事件相抵，避免会话建立后又误判为在线
+        String key = channelKeyOf(app, stream);
+        if (key != null) {
+            pendingOnline.remove(key);
         }
-        RtpSession session = findByStream(stream);
+        RtpSession session = findByStream(app, stream);
+        // 同样只在「ONLINE → 非 ONLINE」时回调一次（ZLM 按协议各报一次下线）
         if (session != null && RtpSession.ONLINE.equals(session.getState())) {
             session.setState(RtpSession.NEGOTIATING);
-            log.info("流下线（RTP 端口 {} 保留等待恢复）: app={}", session.getPort(), app);
+            log.info("流下线（RTP 端口 {} 保留等待恢复）: app={} stream={}",
+                    session.getPort(), app, stream);
             SessionListener l = listener;
             if (l != null) {
                 l.onSessionOffline(session);
@@ -269,6 +347,7 @@ public class RtpSessionManager {
         // 否则会把刚建立的新会话一并摘掉，导致后续 point 报「设备未注册」
         byChannel.remove(session.getChannelId(), session);
         unbindCallId(session);
+        pendingOnline.remove(session.getChannelId());
         session.setState(RtpSession.CLOSED);
         SessionListener l = listener;
         if (l != null) {
@@ -316,6 +395,7 @@ public class RtpSessionManager {
                 log.warn("释放 RTP 服务器异常: {}", session, t);
             }
         }
+        pendingOnline.remove(session.getChannelId());
         session.setState(RtpSession.CLOSED);
         SessionListener l = listener;
         if (l != null) {

@@ -49,6 +49,34 @@ public class MediaServerProperties {
     @Builder.Default
     private final String sipAdvertisedIp = null;
 
+    /**
+     * SIP 注册鉴权密码（平台密码）。
+     *
+     * <p>设备 REGISTER 时平台用 Digest 挑战（401 + WWW-Authenticate），设备带上
+     * 凭据再次 REGISTER，平台校验密码。
+     *
+     * <ul>
+     *   <li>留空（默认）→ 不鉴权（{@code PERMISSIVE}），任何设备都能注册。
+     *       适合内网联调；公网部署务必设置。</li>
+     *   <li>非空 → 平台统一密码，所有设备共用。</li>
+     * </ul>
+     *
+     * <p><b>注意</b>：鉴权只看密码，不校验用户名——SIP 规范里 Authorization 的
+     * username 只是查密码用的键，设备实现差异很大（有的填 SIP 域，有的填设备编号），
+     * 强制校验会导致大量设备注册失败。
+     */
+    @Builder.Default
+    private final String sipPassword = null;
+
+    /**
+     * 自定义凭据提供者（扩展点）。
+     *
+     * <p>设置后优先级高于 {@link #sipPassword}。入参是 Authorization 头的
+     * username（<b>不是</b>设备编号），需要按设备区分密码时在这里自行解析。
+     */
+    @Builder.Default
+    private final io.github.rurulalanana.gb28181.sip.security.CredentialProvider credentialProvider = null;
+
     /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 自动选空闲端口。 */
     @Builder.Default
     private final int httpPort = 8080;

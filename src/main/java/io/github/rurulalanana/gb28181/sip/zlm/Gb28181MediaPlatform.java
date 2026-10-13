@@ -2,6 +2,7 @@ package io.github.rurulalanana.gb28181.sip.zlm;
 
 import io.github.rurulalanana.gb28181.sip.Gb28181SipClient;
 import io.github.rurulalanana.gb28181.sip.Gb28181SipServer;
+import io.github.rurulalanana.gb28181.sip.security.CredentialProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,14 +72,15 @@ public class Gb28181MediaPlatform implements AutoCloseable {
 
         // 无人观看自动关流：ZLM 判定超时后回调，此处发 BYE 并释放会话。
         // 不让 ZLM 直接关流（forceClose 保持 false），因为还需通知 SIP 侧释放设备带宽。
+        // 回调必须透传 app：ZLM 的流标识有两种布局，只给 stream 会拿到裸序号而查不到会话。
         mediaServer.setForceCloseOnNoReader(false);
         mediaServer.setNoReaderListener(new ZlmMediaServer.NoReaderListener() {
             @Override
             public void onNoReader(String app, String stream, String schema) {
                 try {
-                    mediaService.onNoViewer(stream);
+                    mediaService.onNoViewer(app, stream);
                 } catch (Throwable t) {
-                    log.warn("无人观看关流失败: stream={}", stream, t);
+                    log.warn("无人观看关流失败: app={} stream={}", app, stream, t);
                 }
             }
         });
@@ -98,12 +100,37 @@ public class Gb28181MediaPlatform implements AutoCloseable {
                 .port(props.getSipPort())
                 .transport("UDP")
                 .callback(mediaService)
+                .credentialProvider(resolveCredentialProvider(props))
                 .build()
                 .start();
         mediaService.attach(sipServer);
 
         log.info("GB28181 流媒体平台已启动: sip={}:{} media={} http={}",
                 props.getSipHost(), props.getSipPort(), props.getMediaIp(), mediaServer.getHttpPort());
+    }
+
+    /**
+     * 解析注册鉴权策略。
+     *
+     * <p>优先级：{@code credentialProvider} &gt; {@code sipPassword} &gt; 不鉴权。
+     * 返回 {@code null} 表示交给 SIP 服务器用默认的 {@code PERMISSIVE}（不鉴权）。
+     *
+     * <p><b>不校验用户名</b>：SIP 的 Authorization.username 只是查密码用的键，
+     * 各厂商填法不一（SIP 域 / 平台编码 / 设备编号），强制校验会让大量设备注册失败。
+     */
+    private static CredentialProvider resolveCredentialProvider(MediaServerProperties props) {
+        if (props.getCredentialProvider() != null) {
+            log.info("SIP 注册鉴权：使用自定义凭据提供者");
+            return props.getCredentialProvider();
+        }
+        String password = props.getSipPassword();
+        if (password != null && !password.isBlank()) {
+            log.info("SIP 注册鉴权：已启用（平台统一密码）");
+            // 任何 username 都返回同一密码，即只校验密码本身
+            return username -> password;
+        }
+        log.warn("SIP 注册鉴权：未启用（任何设备均可注册）。公网部署请设置 gb28181.sip-password");
+        return null;
     }
 
     /** 停止全部服务（先信令后媒体，最后清会话）。 */

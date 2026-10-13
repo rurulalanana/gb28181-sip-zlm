@@ -38,8 +38,13 @@ public class RtpSession {
     private final String mediaUri;
     /** 传输模式：0 = UDP，1 = TCP 被动（ZLM 监听，设备接入）。 */
     private final int tcpMode;
-    /** SIP Call-ID（BYE 时按此关闭）。 */
-    private final String callId;
+    /**
+     * SIP Call-ID（BYE 时按此关闭）。
+     *
+     * <p>设备主动 INVITE 时构造即确定；平台主动点播时先建会话、后发 INVITE，
+     * 构造传 null，由 {@link #setCallId} 回填，故此处不能是 final。
+     */
+    private volatile String callId;
     /** ZLM RTP 服务器句柄。 */
     private final MK_RTP_SERVER handle;
     /** 实际监听端口。 */
@@ -107,6 +112,17 @@ public class RtpSession {
         return callId;
     }
 
+    /**
+     * 回填 Call-ID（平台主动点播：INVITE 发出后调用）。
+     *
+     * <p>必须同时写回会话对象，不能只更新 {@code RtpSessionManager} 的索引：
+     * 无人观看关流与索引解绑都读 {@link #getCallId()}，若恒为 null 则
+     * 发不出 BYE（设备继续推流）、索引条目也永远摘不掉。
+     */
+    public void setCallId(String callId) {
+        this.callId = callId;
+    }
+
     public MK_RTP_SERVER getHandle() {
         return handle;
     }
@@ -131,10 +147,13 @@ public class RtpSession {
      * ZLM 流名（GB28181 场景）。
      *
      * <p>注意：ZLMediaKit 的 {@code mk_rtp_server_create2} 会把 RTP 会话
-     * 注册为 {@code <channelId>/<序号>}（实测注册日志为
+     * 注册为 {@code <channelId>/0}（实测注册日志恒为
      * {@code rtsp://__defaultVhost__/34020000001310000001/0}），
-     * 而非传入的裸 channelId。播放地址必须用本方法拼出的真实流名，
-     * 否则会出现「媒体已注册但按裸 channelId 访问 404」。
+     * 而非传入的裸 channelId。
+     *
+     * <p><b>序号恒为 0</b>：该序号是 ZLM 内部按 RTP 服务器句柄独立编号的，
+     * 同一设备重复点播不会累加。曾误用全局自增计数器，导致返回
+     * {@code /1}、{@code /4} 等地址，而实际流始终是 {@code /0}。
      */
     public String getStream() {
         return channelId + "/" + streamIndex;

@@ -62,11 +62,32 @@ public class Gb28181MediaService implements SipCallback {
 
     private volatile DeviceListener deviceListener;
 
+    /**
+     * 信令回调委派对象（可选）。
+     *
+     * <p>本服务是 {@link Gb28181SipServer} 唯一的回调接收者，集成方（如 Web 平台）
+     * 需要感知目录应答、报警通知等 MANSCDP 事件时，可在此挂一个委派对象；
+     * 本类<b>先执行自身逻辑，再把事件转发给委派对象</b>，因此不影响原有行为。
+     *
+     * <p>委派对象在 SIP 协议栈线程上被调用，<b>不应阻塞</b>。
+     */
+    private volatile SipCallback callbackDelegate;
+
     public Gb28181MediaService(ZlmMediaServer mediaServer, RtpSessionManager sessionManager,
                                MediaServerProperties props) {
         this.mediaServer = mediaServer;
         this.sessionManager = sessionManager;
         this.props = props;
+    }
+
+    /** 挂载信令回调委派对象；传 {@code null} 取消委派。 */
+    public void setCallbackDelegate(SipCallback delegate) {
+        this.callbackDelegate = delegate;
+    }
+
+    /** 当前委派对象，未挂载时返回 {@code null}。 */
+    public SipCallback callbackDelegate() {
+        return callbackDelegate;
     }
 
     public void attach(Gb28181SipServer sipServer) {
@@ -325,23 +346,24 @@ public class Gb28181MediaService implements SipCallback {
      * <p>相比让 ZLM 直接 {@code mk_media_source_close}，走这里的好处是
      * 会发 SIP BYE 让设备停止推流，而不只是本地断开。
      *
-     * @param stream ZLM 流名（{@code <channelId>/<序号>}，序号需剥离）
+     * <p><b>必须同时传 app 与 stream</b>：ZLM 的流标识有两种布局
+     * （{@code app=rtp, stream=<通道>/<序号>} 与 {@code app=<通道>, stream=<序号>}），
+     * 只看 stream 会在后一种布局下拿到裸序号（如 {@code "0"}）而查不到会话，
+     * 表现为「日志打了『流无观看者』但流一直不关」。
+     *
+     * @param app    ZLM 应用名（可能是 {@code rtp}，也可能是通道编码）
+     * @param stream ZLM 流名（{@code <通道编码>/<序号>} 或裸序号）
      * @return 是否找到并关闭了会话
      */
-    public boolean onNoViewer(String stream) {
-        if (stream == null) {
-            return false;
-        }
-        // 流名形如 <channelId>/<序号>，通道表以裸 channelId 为键
-        String channelKey = stream;
-        int slash = stream.lastIndexOf('/');
-        if (slash > 0) {
-            channelKey = stream.substring(0, slash);
-        }
-        RtpSession session = sessionManager.getByChannel(channelKey);
+    public boolean onNoViewer(String app, String stream) {
+        RtpSession session = sessionManager.resolve(app, stream);
         if (session == null || RtpSession.CLOSED.equals(session.getState())) {
+            // ZLM 对同一个源会按协议各报一次（fmp4/rtmp/rtsp/ts/hls），
+            // 首次关闭后剩余几次查不到会话属正常，降级为 debug 避免刷屏
+            log.debug("无人观看，但未找到对应会话（可能已关闭）: app={} stream={}", app, stream);
             return false;
         }
+        String channelKey = session.getChannelId();
         String callId = session.getCallId();
         String deviceId = session.getDeviceId();
         log.info("无人观看超时，关闭会话: channel={} device={} callId={}", channelKey, deviceId, callId);
@@ -382,12 +404,53 @@ public class Gb28181MediaService implements SipCallback {
         String deviceId = event.getManscdp().getDeviceId();
         AtomicReference<Consumer<List<RecordItem>>> ref =
                 deviceId == null ? null : recordCallbacks.remove(deviceId);
-        if (ref == null || ref.get() == null) {
-            return;
+        if (ref != null && ref.get() != null) {
+            List<RecordItem> items = RecordItem.parse(event);
+            log.info("收到录像检索结果: device={} items={}", deviceId, items.size());
+            ref.get().accept(items);
         }
-        List<RecordItem> items = RecordItem.parse(event);
-        log.info("收到录像检索结果: device={} items={}", deviceId, items.size());
-        ref.get().accept(items);
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onManscdpResponse(event);
+        }
+    }
+
+    @Override
+    public Boolean onManscdpRequest(ManscdpEvent event) {
+        SipCallback delegate = callbackDelegate;
+        return delegate == null ? null : delegate.onManscdpRequest(event);
+    }
+
+    @Override
+    public void onUnknownCommand(ManscdpEvent event) {
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onUnknownCommand(event);
+        }
+    }
+
+    @Override
+    public void onNotify(io.github.rurulalanana.gb28181.sip.event.SubscribeEvent event) {
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onNotify(event);
+        }
+    }
+
+    @Override
+    public void onCascadePlatformRegister(CascadeEvents.PlatformRegistered event) {
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onCascadePlatformRegister(event);
+        }
+    }
+
+    @Override
+    public void onCascadePlatformUnregister(CascadeEvents.PlatformUnregistered event) {
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onCascadePlatformUnregister(event);
+        }
     }
 
     // ==================== 设备事件 ====================
@@ -401,6 +464,10 @@ public class Gb28181MediaService implements SipCallback {
         if (l != null) {
             l.onRegister(event);
         }
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onRegister(event);
+        }
     }
 
     @Override
@@ -409,6 +476,10 @@ public class Gb28181MediaService implements SipCallback {
         DeviceListener l = deviceListener;
         if (l != null) {
             l.onKeepAlive(event);
+        }
+        SipCallback delegate = callbackDelegate;
+        if (delegate != null) {
+            delegate.onKeepAlive(event);
         }
     }
 

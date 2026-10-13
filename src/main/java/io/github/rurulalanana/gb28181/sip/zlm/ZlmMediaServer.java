@@ -7,6 +7,8 @@ import com.sun.jna.Native;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -41,8 +43,15 @@ public class ZlmMediaServer {
     private volatile int rtspPort;
     private volatile int rtcPort;
 
-    /** 流事件监听者（由 RtpSessionManager 设置）。 */
-    private volatile StreamListener streamListener;
+    /**
+     * 流事件监听者。
+     *
+     * <p>是<b>列表</b>而不是单个字段：媒体平台内部需要用它驱动会话状态
+     * （{@code RtpSessionManager}），而调用方（如 spring 侧的事件桥）也要
+     * 用同一份事件落库。早先只有一个 {@code setStreamListener}，后设的会
+     * 覆盖先设的，导致会话状态永远停在 NEGOTIATING。
+     */
+    private final List<StreamListener> streamListeners = new CopyOnWriteArrayList<>();
 
     /** 无人观看回调监听者。 */
     private volatile NoReaderListener noReaderListener;
@@ -69,8 +78,25 @@ public class ZlmMediaServer {
         return api;
     }
 
+    /**
+     * 注册流事件监听者（可注册多个，按注册顺序依次回调）。
+     *
+     * <p>等价于 {@code addStreamListener}，保留此名是为了兼容既有调用方。
+     */
     public void setStreamListener(StreamListener listener) {
-        this.streamListener = listener;
+        addStreamListener(listener);
+    }
+
+    /** 追加一个流事件监听者（重复注册同一个实例不会重复回调）。 */
+    public void addStreamListener(StreamListener listener) {
+        if (listener != null && !streamListeners.contains(listener)) {
+            streamListeners.add(listener);
+        }
+    }
+
+    /** 移除流事件监听者。 */
+    public void removeStreamListener(StreamListener listener) {
+        streamListeners.remove(listener);
     }
 
     /** 注册无人观看监听者。 */
@@ -310,12 +336,17 @@ public class ZlmMediaServer {
             try {
                 String app = a.mk_media_source_get_app(source);
                 String stream = a.mk_media_source_get_stream(source);
-                StreamListener l = streamListener;
-                if (l != null) {
-                    if (regist != 0) {
-                        l.onStreamOnline(app, stream);
-                    } else {
-                        l.onStreamOffline(app, stream);
+                // 依次通知全部监听者：单个监听者抛异常不能影响其它监听者
+                for (StreamListener l : streamListeners) {
+                    try {
+                        if (regist != 0) {
+                            l.onStreamOnline(app, stream);
+                        } else {
+                            l.onStreamOffline(app, stream);
+                        }
+                    } catch (Throwable t) {
+                        log.warn("流事件监听者处理失败: app={} stream={} regist={}",
+                                app, stream, regist, t);
                     }
                 }
             } catch (Throwable t) {
