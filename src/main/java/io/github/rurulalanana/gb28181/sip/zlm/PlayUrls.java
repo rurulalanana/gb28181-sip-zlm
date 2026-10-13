@@ -42,14 +42,39 @@ public class PlayUrls {
     }
 
     /** 应用名 + 流名。 */
+    /**
+     * 生成播放地址。
+     *
+     * <p><b>嵌入式模式（Native.load）下所有协议都不带 app 前缀</b>。
+     * 实测 ZLM 1.12：HTTP 根目录直接是 {@code /<channelId>/<序号>/}，
+     * 没有 {@code /rtp/} 这一层——app 只作为协议内部命名空间存在，
+     * 不体现为 URL 路径段。带前缀的地址会 404。
+     *
+     * <p>正确形态：
+     * <pre>
+     *   http://host:8081/&lt;stream&gt;.live.flv
+     *   http://host:8081/&lt;stream&gt;/hls.m3u8
+     *   rtsp://host:18554/&lt;stream&gt;
+     * </pre>
+     * 其中 {@code stream} 形如 {@code 34020000001310000001/0}
+     * （ZLM 注册的流名带会话序号，见 {@link RtpSession#getStream()}）。
+     *
+     * @param app 仅用于日志与协议内部，<b>不参与 URL 拼接</b>
+     */
     public static PlayUrls of(String host, int httpPort, int rtmpPort, int rtspPort, int rtcPort,
                               String app, String stream) {
-        String httpFlv = httpPort > 0 ? "http://" + host + ":" + httpPort + "/" + app + "/" + stream + ".live.flv" : null;
-        String wsFlv = httpPort > 0 ? "ws://" + host + ":" + httpPort + "/" + app + "/" + stream + ".live.flv" : null;
-        String hls = httpPort > 0 ? "http://" + host + ":" + httpPort + "/" + app + "/" + stream + "/hls.m3u8" : null;
-        String webrtc = rtcPort > 0 ? "webrtc://" + host + ":" + rtcPort + "/" + app + "/" + stream : null;
-        String rtsp = rtspPort > 0 ? "rtsp://" + host + ":" + rtspPort + "/" + app + "/" + stream : null;
-        String rtmp = rtmpPort > 0 ? "rtmp://" + host + ":" + rtmpPort + "/" + app + "/" + stream : null;
+        String httpFlv = httpPort > 0
+                ? "http://" + host + ":" + httpPort + "/" + stream + ".live.flv" : null;
+        String wsFlv = httpPort > 0
+                ? "ws://" + host + ":" + httpPort + "/" + stream + ".live.flv" : null;
+        String hls = httpPort > 0
+                ? "http://" + host + ":" + httpPort + "/" + stream + "/hls.m3u8" : null;
+        String webrtc = rtcPort > 0
+                ? "webrtc://" + host + ":" + rtcPort + "/" + stream : null;
+        String rtsp = rtspPort > 0
+                ? "rtsp://" + host + ":" + rtspPort + "/" + stream : null;
+        String rtmp = rtmpPort > 0
+                ? "rtmp://" + host + ":" + rtmpPort + "/" + stream : null;
         return new PlayUrls(httpFlv, wsFlv, hls, webrtc, rtsp, rtmp);
     }
 }

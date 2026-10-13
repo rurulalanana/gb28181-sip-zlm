@@ -117,12 +117,14 @@ public class MediaServiceUnitTest {
     @Test
     public void 播放地址格式() {
         PlayUrls urls = PlayUrls.of("192.168.1.100", 8080, 1935, 8554, 8000, "rtp", "34020000001320000001");
-        assertEquals("http://192.168.1.100:8080/rtp/34020000001320000001.live.flv", urls.getHttpFlv());
-        assertEquals("ws://192.168.1.100:8080/rtp/34020000001320000001.live.flv", urls.getWsFlv());
-        assertEquals("http://192.168.1.100:8080/rtp/34020000001320000001/hls.m3u8", urls.getHls());
-        assertEquals("webrtc://192.168.1.100:8000/rtp/34020000001320000001", urls.getWebrtc());
-        assertEquals("rtsp://192.168.1.100:8554/rtp/34020000001320000001", urls.getRtsp());
-        assertEquals("rtmp://192.168.1.100:1935/rtp/34020000001320000001", urls.getRtmp());
+        // 嵌入式 ZLM（Native.load）下 app 不体现为 URL 路径段，
+        // 实测 HTTP 根目录直接是 /<channelId>/<序号>/，带 /rtp/ 前缀会 404
+        assertEquals("http://192.168.1.100:8080/34020000001320000001.live.flv", urls.getHttpFlv());
+        assertEquals("ws://192.168.1.100:8080/34020000001320000001.live.flv", urls.getWsFlv());
+        assertEquals("http://192.168.1.100:8080/34020000001320000001/hls.m3u8", urls.getHls());
+        assertEquals("webrtc://192.168.1.100:8000/34020000001320000001", urls.getWebrtc());
+        assertEquals("rtsp://192.168.1.100:8554/34020000001320000001", urls.getRtsp());
+        assertEquals("rtmp://192.168.1.100:1935/34020000001320000001", urls.getRtmp());
     }
 
     @Test

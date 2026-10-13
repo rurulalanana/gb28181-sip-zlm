@@ -6,6 +6,7 @@ import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -67,7 +68,9 @@ public class ZlmMediaServerTest {
 
             PlayUrls urls = server.playUrls("smoke-cam-1");
             assertTrue(urls.getHttpFlv().contains("smoke-cam-1.live.flv"));
-            assertTrue(urls.getRtmp().contains("/rtp/smoke-cam-1"));
+            // 嵌入式 ZLM 下 app 不进URL 路径，故不含 /rtp/
+            assertTrue(urls.getRtmp().contains("/smoke-cam-1"));
+            assertFalse("RTMP 地址不应含 app 前缀", urls.getRtmp().contains("/rtp/"));
 
             ZlmMediaServer.api().mk_rtp_server_release(handle);
             ZlmMediaServer.api().mk_rtp_server_release(tcpHandle);
