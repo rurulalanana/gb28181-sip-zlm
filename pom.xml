@@ -14,7 +14,7 @@
     GB28181 流媒体服务：基于 gb28181-sip 信令模块 + ZLMediaKit（zlm4j）的收流集成。
     信令（REGISTER/INVITE/BYE）由 gb28181-sip 处理，媒体（RTP/PS 接收、多协议输出）由 ZLMediaKit 处理。
   </description>
-  <url>https://github.com/rurulalanana/gb28181-sip</url>
+  <url>https://github.com/rurulalanana/gb28181-sip-zlm</url>
 
   <licenses>
     <license>
@@ -33,7 +33,7 @@
   </developers>
 
   <scm>
-    <url>https://github.com/rurulalanana/gb28181-sip</url>
+    <url>https://github.com/rurulalanana/gb28181-sip-zlm</url>
     <connection>scm:git:https://github.com/rurulalanana/gb28181-sip.git</connection>
     <developerConnection>scm:git:https://github.com/rurulalanana/gb28181-sip.git</developerConnection>
     <tag>HEAD</tag>
