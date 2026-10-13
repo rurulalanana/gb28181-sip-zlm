@@ -90,6 +90,9 @@ public class RtpSessionManager {
         if (old != null) {
             log.info("通道 {} 已有会话，先关闭旧会话: {}", channelId, old);
             closeByChannel(channelId);
+            // mk_rtp_server_release 会同步触发 native detach 回调，
+            // 必须等它跑完再建新句柄，否则 ZLM 侧存在二次释放竞争（表现为 JVM 崩溃）
+            awaitDetachQuietly(old, 20);
         }
 
         ZLMApi api = ZlmMediaServer.api();
@@ -129,7 +132,13 @@ public class RtpSessionManager {
 
     /** 按通道关闭会话（BYE 携带设备/通道编码时使用）。 */
     public void closeByChannel(String channelId) {
-        RtpSession session = byChannel.remove(channelId);
+        // 用条件删除：仅当映射仍指向本会话时才摘除。
+        // 直接 remove 会把「通道上已换成新会话」的场景一起清掉，
+        // 那是重复点播崩溃的直接原因（native detach 回调竞争 → 访问违例）。
+        RtpSession session = byChannel.get(channelId);
+        if (session != null && !byChannel.remove(channelId, session)) {
+            return; // 期间已被新会话替换，无需处理
+        }
         if (session != null) {
             unbindCallId(session);
             release(session);
@@ -225,7 +234,9 @@ public class RtpSessionManager {
             return; // 已由主动关闭路径处理过
         }
         log.info("RTP 服务器 detach: {}", session);
-        byChannel.remove(session.getChannelId());
+        // 重复点播时通道上可能已挂着新会话，只有映射仍指向本会话才清理，
+        // 否则会把刚建立的新会话一并摘掉，导致后续 point 报「设备未注册」
+        byChannel.remove(session.getChannelId(), session);
         unbindCallId(session);
         session.setState(RtpSession.CLOSED);
         SessionListener l = listener;
@@ -238,6 +249,33 @@ public class RtpSessionManager {
      * 主动释放 ZLM RTP 服务器。
      * 若会话已被 detach（ZLM 侧销毁），跳过 release 避免二次释放。
      */
+    /**
+     * 等待旧会话的 native 释放彻底结束，再创建新句柄。
+     *
+     * <p>{@code mk_rtp_server_release} 会回到 ZLM 的 C++ 侧销毁对象，
+     * 该过程与 detach 回调在同一线程/事件循环内完成；此处等待其返回，
+     * 避免紧接着创建新句柄时与之竞争，造成 JVM 访问违例。
+     *
+     * <p>release 是同步调用，返回即表示 native 侧已处理完，
+     * 这里只做一次让出，确保 detach 回调有机会在事件循环跑完。
+     */
+    private void awaitDetachQuietly(RtpSession session, int rounds) {
+        for (int i = 0; i < rounds; i++) {
+            if (RtpSession.CLOSED.equals(session.getState())) {
+                return;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (!RtpSession.CLOSED.equals(session.getState())) {
+            log.warn("旧会话 {} 释放后仍处于非 CLOSED 状态，继续建立新会话", session);
+        }
+    }
+
     private void release(RtpSession session) {
         if (session.markDetached()) {
             try {
