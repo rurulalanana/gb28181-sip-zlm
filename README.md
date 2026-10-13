@@ -191,6 +191,26 @@ mvn test
 
 > 原生测试在无匹配平台原生库时自动跳过（JUnit `Assume`）。
 
+## 排障
+
+### `NoClassDefFoundError: com/aizuda/zlm4j/core/ZLMApi`
+
+`zlm4j`（1.12.0，compile 作用域）是本模块的传递依赖，未进 classpath 通常是**本地 Maven 缓存了"构件不存在"的结论**——版本刚发布时国内镜像（阿里云等）有几分钟同步延迟，Maven 把 404 写进 `~/.m2/repository/**/*.lastUpdated` 后不再重试。
+
+```bash
+mvn dependency:tree | grep zlm4j    # 确认依赖树
+mvn -U clean install                # 强制更新（最常见解法）
+rm -rf ~/.m2/repository/com/aizuda/zlm4j   # 仍不行则清缓存重下
+```
+
+### 其它启动期现象
+
+| 现象 | 原因 |
+|---|---|
+| `UnsatisfiedLinkError` / 加载 `mk_api` 失败 | zlm4j 1.12.0 内含 win/linux/mac（x86_64 与 arm64）原生库，检查是否被裁剪或平台不支持 |
+| 媒体服务"启动失败"但无堆栈 | `mk_http_server_start` 等**返回 0 而不抛异常**，需看 ZLM 原生日志判断 |
+| 端口明明空闲却报启动失败 | ZLM 返回 `uint16_t`，若经有符号 `short` 中转会变负数；本模块已按无符号解读 |
+
 ## 已知限制
 
 - **未做真实 RTP/PS 媒体流验证**：E2E 验证到信令协商 + RTP 服务器生命周期 + 录制/转推句柄可用性；完整媒体链路（设备推流 → 画面出流 → 出录像文件）需要真实 GB28181 设备（或 EasyGBD 模拟）验证
