@@ -155,6 +155,63 @@ public class Gb28181MediaService implements SipCallback {
         }
     }
 
+    /**
+     * 处理设备对 INVITE 的响应。
+     *
+     * <p>平台主动点播时，设备回200 OK 会话才算真正建立：
+     * 必须解析应答 SDP 的对端收流地址与端口，并补发 ACK 完成握手，
+     * 否则会话永远停在 NEGOTIATING，媒体也不会开始推流。
+     *
+     * <p>此前本类未实现该回调，是真机点播「已发 INVITE 但无画面」的根因之一。
+     */
+    @Override
+    public void onRawResponse(javax.sip.ResponseEvent event) {
+        javax.sip.message.Response response = event.getResponse();
+        if (response == null || response.getStatusCode() != javax.sip.message.Response.OK) {
+            return;
+        }
+        // 用 CSeq 判断是否为 INVITE 的应答（jain-sip 的事务接口未暴露请求方法）
+        javax.sip.header.CSeqHeader cseq =
+                (javax.sip.header.CSeqHeader) response.getHeader("CSeq");
+        if (cseq == null || !"INVITE".equalsIgnoreCase(cseq.getMethod())) {
+            return;
+        }
+        String callId = callIdOf(response);
+        RtpSession session = sessionManager.getByCallId(callId);
+        if (session == null) {
+            return;
+        }
+
+        // 应答 SDP 记录以备排查（收流端口由平台侧 INVITE 的 m= 行给出，
+        // 设备据此主动推流，故无需在此另存设备地址）
+        Object raw = response.getRawContent();
+        if (raw != null) {
+            String xml = new String((byte[]) raw,
+                    java.nio.charset.Charset.forName("UTF-8"));
+            log.info("INVITE 应答 SDP: callId={}\n{}", callId, xml);
+        }
+
+        // 补发 ACK 完成握手
+        String toTag = toTagOf(response);
+        try {
+            client().ackInvite(session.getDeviceId(), callId, toTag, null);
+            log.info("INVITE 已被设备接受，已回 ACK: {} toTag={}", session, toTag);
+        } catch (Exception e) {
+            log.error("回 ACK 失败: {}", session, e);
+        }
+    }
+
+    private static String callIdOf(javax.sip.message.Response response) {
+        javax.sip.header.CallIdHeader h =
+                (javax.sip.header.CallIdHeader) response.getHeader("Call-ID");
+        return h == null ? null : h.getCallId();
+    }
+
+    private static String toTagOf(javax.sip.message.Response response) {
+        javax.sip.header.ToHeader h = (javax.sip.header.ToHeader) response.getHeader("To");
+        return h == null ? null : h.getTag();
+    }
+
     @Override
     public void onBye(InviteEvent event) {
         RtpSession session = sessionManager.getByCallId(event.getCallId());
@@ -434,7 +491,12 @@ public class Gb28181MediaService implements SipCallback {
                 .mediaPort(session.getPort())
                 .mediaProto(tcp ? SdpMessage.PROTO_TCP : SdpMessage.PROTO_UDP)
                 .payloadType("96")
-                .rtpmap("96", "PS")
+                // pt=96 对应 H.264，rtpmap 必须写 H264；写 PS 会让真实设备
+                // 无法识别编码格式并拒绝 INVITE（标准附录 A payload 表）
+                .rtpmap("96", "H264")
+                // f= 为国标必填扩展，缺失时部分设备直接丢弃 INVITE（附录 G）
+                .mediaFormat(io.github.rurulalanana.gb28181.sip.sdp.SdpMediaFormat.videoOnly(
+                        "2", "5", 25, 1, 1024))
                 .ssrc(session.getSsrc());
         if (session.getMediaUri() != null) {
             sdp.uri(session.getMediaUri());

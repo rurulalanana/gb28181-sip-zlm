@@ -68,7 +68,7 @@ public class MediaServiceUnitTest {
     // ==================== SDP 应答 ====================
 
     @Test
-    public void 应答SDP应为国标PS格式() {
+    public void 应答SDP应为国标格式() {
         RtpSession session = fakeSession(6000, "0100000001");
         SdpMessage sdp = service.buildAnswerSdp(session, false);
         String text = sdp.toText();
@@ -78,7 +78,10 @@ public class MediaServiceUnitTest {
         assertTrue("c= 应为媒体IP: " + text, text.contains("c=IN IP4 192.168.1.100"));
         assertTrue("t=0 0 缺失: " + text, text.contains("t=0 0"));
         assertTrue("m= 行应为 UDP/96/协商端口: " + text, text.contains("m=video 6000 RTP/AVP 96"));
-        assertTrue("a=rtpmap:96 PS/90000 缺失: " + text, text.contains("a=rtpmap:96 PS/90000"));
+        // pt=96 对应 H.264，写 PS 会让真实设备拒绝 INVITE
+        assertTrue("a=rtpmap:96 H264/90000 缺失: " + text, text.contains("a=rtpmap:96 H264/90000"));
+        // f= 为国标必填扩展（附录 G），缺失时部分设备直接丢弃 INVITE
+        assertTrue("f= 缺失: " + text, text.contains("f=v/2/5/25/1/1024/a///"));
         assertTrue("y= 应为平台SSRC: " + text, text.contains("y=0100000001"));
         assertFalse("UDP 不应带 setup: " + text, text.contains("setup"));
     }
