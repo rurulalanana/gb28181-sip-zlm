@@ -183,6 +183,13 @@ public class RtpSessionManager {
         }
     }
 
+    /** 记录对端 To-tag（收到设备 200 OK 后调用），BYE 时需要。 */
+    public void bindToTag(RtpSession session, String toTag) {
+        if (session != null) {
+            session.setToTag(toTag);
+        }
+    }
+
     public RtpSession getByCallId(String callId) {
         return byCallId.get(callId);
     }

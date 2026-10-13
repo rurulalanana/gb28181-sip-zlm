@@ -44,6 +44,12 @@ public class ZlmMediaServer {
     /** 流事件监听者（由 RtpSessionManager 设置）。 */
     private volatile StreamListener streamListener;
 
+    /** 无人观看回调监听者。 */
+    private volatile NoReaderListener noReaderListener;
+
+    /** 无人观看时是否由 ZLM 直接关流（否则交业务侧处理）。 */
+    private volatile boolean forceCloseOnNoReader;
+
     /** 必须强引用：JNA 回调被 GC 后原生侧调用会崩溃。 */
     private MK_EVENTS events;
 
@@ -67,6 +73,28 @@ public class ZlmMediaServer {
         this.streamListener = listener;
     }
 
+    /** 注册无人观看监听者。 */
+    public void setNoReaderListener(NoReaderListener listener) {
+        this.noReaderListener = listener;
+    }
+
+    /** 无人观看时是否由 ZLM 直接关流。 */
+    public void setForceCloseOnNoReader(boolean force) {
+        this.forceCloseOnNoReader = force;
+    }
+
+    /** 无人观看事件监听者。 */
+    public interface NoReaderListener {
+        /**
+         * 某流持续无人观看。
+         *
+         * @param app流所属应用
+         * @param stream 流名（形如 {@code <channelId>/<序号>}）
+         * @param schema 协议（rtp/ts/hls/fmp4/rtmp）
+         */
+        void onNoReader(String app, String stream, String schema);
+    }
+
     // ==================== 生命周期 ====================
 
     /** 初始化 ZLM 环境并按配置启动各协议服务。幂等。 */
@@ -77,6 +105,7 @@ public class ZlmMediaServer {
         ZLMApi a = api();
         // 负载类型需在 env 初始化前写入全局配置（国标默认 PS=96）
         applyPayloadTypes(a);
+        applyProtocolOptions(a);
         // 线程数=1, 日志级别=1, 控制台日志开；不加载外部 ini（默认配置已适配 GB28181：ps_pt=96, rtp 超时 15s）
         a.mk_env_init2(1, 1, 1, null, 0, 0, null, 0, null, null);
 
@@ -203,12 +232,69 @@ public class ZlmMediaServer {
         if (value <= 0) {
             return;
         }
+        setOption(a, key, String.valueOf(value));
+    }
+
+    /**
+     * 设置 ZLM 配置项。
+     *
+     * <p>库模式（{@code Native.load("mk_api")}）没有 ini 文件，
+     * 所有 {@code [protocol] / [hls] / [general]} 段配置都要在此注入，
+     * 否则转协议（HLS/TS/fMP4）与无人观看检测等能力不会启用。
+     */
+    private void setOption(ZLMApi a, String key, String value) {
+        if (value == null || value.isEmpty()) {
+            return;
+        }
         try {
-            a.mk_set_option(key, String.valueOf(value));
+            a.mk_set_option(key, value);
             log.info("ZLM 配置 {}={}", key, value);
         } catch (Throwable t) {
             log.warn("设置 ZLM 配置 {}={} 失败: {}", key, value, t.getMessage());
         }
+    }
+
+    /**
+     * 注入转协议与流管理相关配置。
+     *
+     * <p>对应 ZLM 的 {@code [protocol]} / {@code [hls]} / {@code [general]} 段。
+     * 缺任何一项都会导致对应的播放协议不可用：
+     * <ul>
+     *   <li>{@code protocol.enable_hls} —— 不开则 HLS 切片不生成</li>
+     *   <li>{@code hls.hls_save_path} / {@code http.rootPath} —— 切片落盘目录</li>
+     *   <li>{@code general.streamNoneReaderDelayMS} —— 无人观看判定时长</li>
+     * </ul>
+     */
+    private void applyProtocolOptions(ZLMApi a) {
+        // ---- [protocol] 转协议开关 ----
+        setOption(a, "protocol.enable_hls", props.isEnableHls() ? "1" : "0");
+        setOption(a, "protocol.enable_ts", props.isEnableTs() ? "1" : "0");
+        setOption(a, "protocol.enable_fmp4", props.isEnableFmp4() ? "1" : "0");
+        setOption(a, "protocol.enable_rtmp", props.isEnableRtmp() ? "1" : "0");
+        setOption(a, "protocol.enable_rtsp", props.isEnableRtsp() ? "1" : "0");
+        setOption(a, "protocol.enable_audio", props.isEnableAudio() ? "1" : "0");
+        setOption(a, "protocol.hls_demand", "0");
+        setOption(a, "protocol.rtmp_demand", "0");
+        setOption(a, "protocol.ts_demand", "0");
+        setOption(a, "protocol.fmp4_demand", "0");
+
+        // ---- [hls] 切片 ----
+        setOption(a, "hls.hls_save_path", props.getHlsSavePath());
+        setOption(a, "hls.segDur", String.valueOf(props.getHlsSegDur()));
+        setOption(a, "hls.segNum", String.valueOf(props.getHlsSegNum()));
+        setOption(a, "hls.segRetain", String.valueOf(props.getHlsSegRetain()));
+        setOption(a, "hls.fastRegister", "1");
+
+        // ---- [http] 静态目录（HLS 切片经此暴露给浏览器） ----
+        setOption(a, "http.rootPath", props.getHlsSavePath());
+        setOption(a, "http.dirMenu", "1");
+        setOption(a, "http.allow_cross_domains", "1");
+
+        // ---- [general] 流管理 ----
+        setOption(a, "general.enableVhost", "0");
+        setOption(a, "general.maxStreamWaitMS", String.valueOf(props.getMaxStreamWaitMs()));
+        setOption(a, "general.streamNoneReaderDelayMS",
+                String.valueOf(props.getStreamNoneReaderDelayMs()));
     }
 
     private MK_EVENTS buildEvents(ZLMApi a) {
@@ -234,6 +320,31 @@ public class ZlmMediaServer {
                 }
             } catch (Throwable t) {
                 log.warn("处理 on_mk_media_changed 异常", t);
+            }
+        };
+
+        // 无人观看回调（依赖 general.streamNoneReaderDelayMS 配置生效）：
+        // 超过该时长仍无播放者时触发。平台据此发 BYE 释放设备带宽。
+        // force=1 立即关闭该流，force=0 走正常关闭流程。
+        ev.on_mk_media_no_reader = new com.aizuda.zlm4j.callback.IMKNoReaderCallBack() {
+            @Override
+            public void invoke(com.aizuda.zlm4j.structure.MK_MEDIA_SOURCE ctx) {
+                try {
+                    String app = a.mk_media_source_get_app(ctx);
+                    String stream = a.mk_media_source_get_stream(ctx);
+                    String schema = a.mk_media_source_get_schema(ctx);
+                    log.info("流无观看者: schema={} app={} stream={}", schema, app, stream);
+                    NoReaderListener l = noReaderListener;
+                    if (l != null) {
+                        l.onNoReader(app, stream, schema);
+                    }
+                    if (forceCloseOnNoReader) {
+                        a.mk_media_source_close(ctx, 1);
+                        log.info("已按无人观看策略关闭流: {}:{}", app, stream);
+                    }
+                } catch (Throwable t) {
+                    log.warn("处理无人观看回调异常", t);
+                }
             }
         };
 

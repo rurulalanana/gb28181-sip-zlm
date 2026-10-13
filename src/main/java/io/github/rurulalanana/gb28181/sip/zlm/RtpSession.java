@@ -46,6 +46,9 @@ public class RtpSession {
     private final int port;
 
     private volatile String state = NEGOTIATING;
+
+    /** 对端 To-tag（设备 200 OK 中的 tag），发 BYE 时需要。 */
+    private volatile String toTag;
     private final AtomicBoolean detached = new AtomicBoolean(false);
     private final long createdAt = System.currentTimeMillis();
 
@@ -148,6 +151,14 @@ public class RtpSession {
      * @return true 表示本次调用是首个标记者（调用方需负责后续清理；
      *         detach 回调与主动关闭只有一个路径会拿到 true）
      */
+    public String getToTag() {
+        return toTag;
+    }
+
+    public void setToTag(String toTag) {
+        this.toTag = toTag;
+    }
+
     public boolean markDetached() {
         return detached.compareAndSet(false, true);
     }

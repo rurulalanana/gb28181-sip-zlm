@@ -69,6 +69,20 @@ public class Gb28181MediaPlatform implements AutoCloseable {
             }
         });
 
+        // 无人观看自动关流：ZLM 判定超时后回调，此处发 BYE 并释放会话。
+        // 不让 ZLM 直接关流（forceClose 保持 false），因为还需通知 SIP 侧释放设备带宽。
+        mediaServer.setForceCloseOnNoReader(false);
+        mediaServer.setNoReaderListener(new ZlmMediaServer.NoReaderListener() {
+            @Override
+            public void onNoReader(String app, String stream, String schema) {
+                try {
+                    mediaService.onNoViewer(stream);
+                } catch (Throwable t) {
+                    log.warn("无人观看关流失败: stream={}", stream, t);
+                }
+            }
+        });
+
         // 3. 级联转发 / 语音广播 + 信令服务（回调 = 流媒体服务）
         cascadeForwarder = new CascadeForwarder(mediaServer, sessionManager, props);
         broadcastService = new BroadcastService(mediaServer, sessionManager, props);

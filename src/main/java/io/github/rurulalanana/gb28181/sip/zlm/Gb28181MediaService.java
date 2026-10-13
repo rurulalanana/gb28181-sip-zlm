@@ -193,6 +193,7 @@ public class Gb28181MediaService implements SipCallback {
 
         // 补发 ACK 完成握手
         String toTag = toTagOf(response);
+        sessionManager.bindToTag(session, toTag);
         try {
             client().ackInvite(session.getDeviceId(), callId, toTag, null);
             log.info("INVITE 已被设备接受，已回 ACK: {} toTag={}", session, toTag);
@@ -313,6 +314,47 @@ public class Gb28181MediaService implements SipCallback {
     /** 停止某通道的点播（释放收流端口；BYE 由业务侧按需发送）。 */
     public void stop(String deviceId) {
         sessionManager.closeByChannel(deviceId);
+    }
+
+    /**
+     * 无人观看超时：发 BYE 释放设备带宽并关闭会话。
+     *
+     * <p>由 {@code ZlmMediaServer} 的无人观看回调驱动（判定时长见
+     * {@code general.streamNoneReaderDelayMS}）。
+     *
+     * <p>相比让 ZLM 直接 {@code mk_media_source_close}，走这里的好处是
+     * 会发 SIP BYE 让设备停止推流，而不只是本地断开。
+     *
+     * @param stream ZLM 流名（{@code <channelId>/<序号>}，序号需剥离）
+     * @return 是否找到并关闭了会话
+     */
+    public boolean onNoViewer(String stream) {
+        if (stream == null) {
+            return false;
+        }
+        // 流名形如 <channelId>/<序号>，通道表以裸 channelId 为键
+        String channelKey = stream;
+        int slash = stream.lastIndexOf('/');
+        if (slash > 0) {
+            channelKey = stream.substring(0, slash);
+        }
+        RtpSession session = sessionManager.getByChannel(channelKey);
+        if (session == null || RtpSession.CLOSED.equals(session.getState())) {
+            return false;
+        }
+        String callId = session.getCallId();
+        String deviceId = session.getDeviceId();
+        log.info("无人观看超时，关闭会话: channel={} device={} callId={}", channelKey, deviceId, callId);
+        try {
+            if (callId != null && deviceId != null) {
+                client().bye(deviceId, callId, session.getToTag());
+            }
+        } catch (Exception e) {
+            // BYE 失败不阻断本地会话释放
+            log.warn("发送 BYE 失败: device={} callId={}, {}", deviceId, callId, e.getMessage());
+        }
+        sessionManager.closeByChannel(channelKey);
+        return true;
     }
 
     public PlayUrls playUrls(String deviceId) {
