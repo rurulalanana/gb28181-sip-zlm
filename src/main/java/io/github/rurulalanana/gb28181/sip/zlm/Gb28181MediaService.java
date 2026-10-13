@@ -490,13 +490,16 @@ public class Gb28181MediaService implements SipCallback {
                 .realtime()
                 .mediaPort(session.getPort())
                 .mediaProto(tcp ? SdpMessage.PROTO_TCP : SdpMessage.PROTO_UDP)
-                .payloadType("96")
-                // pt=96 对应 H.264，rtpmap 必须写 H264；写 PS 会让真实设备
-                // 无法识别编码格式并拒绝 INVITE（标准附录 A payload 表）
-                .rtpmap("96", "H264")
-                // f= 为国标必填扩展，缺失时部分设备直接丢弃 INVITE（附录 G）
-                .mediaFormat(io.github.rurulalanana.gb28181.sip.sdp.SdpMediaFormat.videoOnly(
-                        "2", "5", 25, 1, 1024))
+                // 国标约定：平台下行 INVITE 时 pt=96 固定为 PS 封装，
+                // 并同时宣告 97/98/99（mpeg4/H264/H265）供设备选择内部编码。
+                // 实际验证（WVP-GB28181-pro 与 EasyGBD_Demo）：只宣告 H264 会让
+                // 设备解析 SDP 成功后回 500 —— 它按 PS 封装推流。
+                .payloadType("96 97 98 99")
+                .rtpmap("96", "PS")
+                .rtpmap("98", "H264")
+                .rtpmap("97", "MPEG4")
+                .rtpmap("99", "H265")
+                .recvonly()
                 .ssrc(session.getSsrc());
         if (session.getMediaUri() != null) {
             sdp.uri(session.getMediaUri());

@@ -68,7 +68,7 @@ public class MediaServiceUnitTest {
     // ==================== SDP 应答 ====================
 
     @Test
-    public void 应答SDP应为国标格式() {
+    public void 点播下行SDP应符合国标约定() {
         RtpSession session = fakeSession(6000, "0100000001");
         SdpMessage sdp = service.buildAnswerSdp(session, false);
         String text = sdp.toText();
@@ -77,11 +77,15 @@ public class MediaServiceUnitTest {
         assertTrue("o= 应含平台编码与媒体IP: " + text, text.contains("o=" + PLATFORM_ID + " 0 0 IN IP4 192.168.1.100"));
         assertTrue("c= 应为媒体IP: " + text, text.contains("c=IN IP4 192.168.1.100"));
         assertTrue("t=0 0 缺失: " + text, text.contains("t=0 0"));
-        assertTrue("m= 行应为 UDP/96/协商端口: " + text, text.contains("m=video 6000 RTP/AVP 96"));
-        // pt=96 对应 H.264，写 PS 会让真实设备拒绝 INVITE
-        assertTrue("a=rtpmap:96 H264/90000 缺失: " + text, text.contains("a=rtpmap:96 H264/90000"));
-        // f= 为国标必填扩展（附录 G），缺失时部分设备直接丢弃 INVITE
-        assertTrue("f= 缺失: " + text, text.contains("f=v/2/5/25/1/1024/a///"));
+        assertTrue("m= 行应为 UDP/多路pt/协商端口: " + text, text.contains("m=video 6000 RTP/AVP 96 97 98 99"));
+        // 国标约定：pt=96 固定为 PS 封装，并宣告 97/98/99 供设备选择编码
+        // 对照 WVP-GB28181-pro SIPCommander#buildInviteSdp
+        assertTrue("a=rtpmap:96 PS/90000 缺失: " + text, text.contains("a=rtpmap:96 PS/90000"));
+        assertTrue("a=rtpmap:98 H264/90000 缺失: " + text, text.contains("a=rtpmap:98 H264/90000"));
+        assertTrue("a=rtpmap:99 H265/90000 缺失: " + text, text.contains("a=rtpmap:99 H265/90000"));
+        assertTrue("m= 应宣告多路 pt: " + text, text.contains("RTP/AVP 96 97 98 99"));
+        // 平台下行时须带 a=recvonly（平台只收不发）
+        assertTrue("a=recvonly 缺失: " + text, text.contains("a=recvonly"));
         assertTrue("y= 应为平台SSRC: " + text, text.contains("y=0100000001"));
         assertFalse("UDP 不应带 setup: " + text, text.contains("setup"));
     }

@@ -89,8 +89,9 @@ public class Gb28181MediaPlatformE2ETest {
             assertNotNull("会话应按通道登记", session);
             assertEquals("SDP 端口应与 ZLM RTP 服务器端口一致",
                     session.getPort(), answerPort);
-            assertTrue("应答 SDP 应为 H264/90000: " + answerSdp, answerSdp.contains("a=rtpmap:96 H264/90000"));
-            assertTrue("应答 SDP 应含 f= 字段: " + answerSdp, answerSdp.contains("f=v/2/5/25/1/1024/a///"));
+            // 国标约定：pt=96 为 PS 封装，另宣告 97/98/99（对照 WVP-GB28181-pro）
+            assertTrue("应答 SDP 应为 PS/90000: " + answerSdp, answerSdp.contains("a=rtpmap:96 PS/90000"));
+            assertTrue("应答 SDP 应含 a=recvonly: " + answerSdp, answerSdp.contains("a=recvonly"));
             assertTrue("应答 SDP 应含平台 SSRC(y=10位): " + answerSdp,
                     Pattern.compile("y=\\d{10}").matcher(answerSdp).find());
             assertTrue("应答 SDP 应为媒体 IP: " + answerSdp, answerSdp.contains("c=IN IP4 127.0.0.1"));
