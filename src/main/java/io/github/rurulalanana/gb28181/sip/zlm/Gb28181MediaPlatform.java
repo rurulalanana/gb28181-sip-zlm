@@ -80,6 +80,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         sipServer = Gb28181SipServer.builder()
                 .serverId(props.getPlatformId())
                 .host(props.getSipHost())
+                .advertisedHost(props.getSipAdvertisedIp())
                 .port(props.getSipPort())
                 .transport("UDP")
                 .callback(mediaService)

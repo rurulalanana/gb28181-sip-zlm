@@ -40,6 +40,15 @@ public class MediaServerProperties {
     @Builder.Default
     private final String sipHost = "0.0.0.0";
 
+    /**
+     * SIP 对外通告地址（写入 INVITE 的 From / Contact）。
+     *
+     * <p>留空时自动推断本机非回环 IPv4（与 {@link #mediaIp} 同源）。
+     * NAT 后或多网卡场景应显式配置为设备可达的地址。
+     */
+    @Builder.Default
+    private final String sipAdvertisedIp = null;
+
     /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 自动选空闲端口。 */
     @Builder.Default
     private final int httpPort = 8080;
