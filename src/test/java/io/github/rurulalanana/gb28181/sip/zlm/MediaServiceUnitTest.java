@@ -91,13 +91,29 @@ public class MediaServiceUnitTest {
     }
 
     @Test
-    public void tcp应答SDP应带setupPassive与TCP协议() {
+    public void tcp应答SDP应用TCP协议并宣告多路pt() {
         RtpSession session = fakeSession(6001, "0100000002");
         SdpMessage sdp = service.buildAnswerSdp(session, true);
         String text = sdp.toText();
 
-        assertTrue("TCP 应为 TCP/RTP/AVP: " + text, text.contains("m=video 6001 TCP/RTP/AVP 96"));
-        assertTrue("TCP 应答应带 a=setup:passive: " + text, text.contains("a=setup:passive"));
+        assertTrue("TCP 应为 TCP/RTP/AVP: " + text, text.contains("m=video 6001 TCP/RTP/AVP"));
+        // 国标约定：pt=96 固定 PS 封装，同时宣告 97/98/99 供设备选择内部编码。
+        // 只宣告单一编码会让设备按 PS 推流却收到 H264 声明，进而回 500。
+        assertTrue("应宣告 96 为 PS 封装: " + text, text.contains("a=rtpmap:96 PS/90000"));
+        assertTrue("应宣告多路 pt: " + text, text.contains("96 97 98 99"));
+        assertTrue("应带 recvonly: " + text, text.contains("a=recvonly"));
+        // 下行不下发 a=setup:passive —— 与 WVP-GB28181-pro 实际报文一致，
+        // 其源码该行已被注释（未发现支持此特性的设备）。
+        assertFalse("下行不应下发 a=setup:passive: " + text, text.contains("a=setup:passive"));
+    }
+
+    /** UDP 应答同样宣告 PS + 多路 pt，且协议为 UDP。 */
+    @Test
+    public void udp应答SDP应宣告PS与多路pt() {
+        RtpSession session = fakeSession(6001, "0100000002");
+        String text = service.buildAnswerSdp(session, false).toText();
+        assertTrue("UDP 应为 RTP/AVP: " + text, text.contains("m=video 6001 RTP/AVP 96 97 98 99"));
+        assertTrue("应带 ssrc: " + text, text.contains("y=0100000002"));
     }
 
     // ==================== SSRC 归一化 ====================
@@ -116,15 +132,31 @@ public class MediaServiceUnitTest {
 
     @Test
     public void 播放地址格式() {
-        PlayUrls urls = PlayUrls.of("192.168.1.100", 8080, 1935, 8554, 8000, "rtp", "34020000001320000001");
-        // 嵌入式 ZLM（Native.load）下 app 不体现为 URL 路径段，
-        // 实测 HTTP 根目录直接是 /<channelId>/<序号>/，带 /rtp/ 前缀会 404
-        assertEquals("http://192.168.1.100:8080/34020000001320000001.live.flv", urls.getHttpFlv());
-        assertEquals("ws://192.168.1.100:8080/34020000001320000001.live.flv", urls.getWsFlv());
-        assertEquals("http://192.168.1.100:8080/34020000001320000001/hls.m3u8", urls.getHls());
-        assertEquals("webrtc://192.168.1.100:8000/34020000001320000001", urls.getWebrtc());
-        assertEquals("rtsp://192.168.1.100:8554/34020000001320000001", urls.getRtsp());
-        assertEquals("rtmp://192.168.1.100:1935/34020000001320000001", urls.getRtmp());
+        // 单端口收流（e1b0dac）后启用「会话双坐标」：app = 设备编码，
+        // stream = <设备编码>_<通道编码>，app 重新作为 URL 路径段参与拼接。
+        PlayUrls urls = PlayUrls.of("192.168.1.100", 8080, 1935, 8554, 8000,
+                "34020000001320000001", "34020000001320000001_34020000001310000001");
+        assertEquals("http://192.168.1.100:8080/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001.live.flv", urls.getHttpFlv());
+        assertEquals("ws://192.168.1.100:8080/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001.live.flv", urls.getWsFlv());
+        assertEquals("http://192.168.1.100:8080/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001/hls.m3u8", urls.getHls());
+        assertEquals("webrtc://192.168.1.100:8000/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001", urls.getWebrtc());
+        assertEquals("rtsp://192.168.1.100:8554/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001", urls.getRtsp());
+        assertEquals("rtmp://192.168.1.100:1935/34020000001320000001"
+                + "/34020000001320000001_34020000001310000001", urls.getRtmp());
+    }
+
+    /** app 为空时退化为仅 stream，不产生前导斜杠。 */
+    @Test
+    public void app为空时不拼前缀() {
+        PlayUrls urls = PlayUrls.of("192.168.1.100", 8080, -1, -1, -1, null, "cam1");
+        assertEquals("http://192.168.1.100:8080/cam1.live.flv", urls.getHttpFlv());
+        PlayUrls blank = PlayUrls.of("192.168.1.100", 8080, -1, -1, -1, "  ", "cam1");
+        assertEquals("http://192.168.1.100:8080/cam1.live.flv", blank.getHttpFlv());
     }
 
     @Test
