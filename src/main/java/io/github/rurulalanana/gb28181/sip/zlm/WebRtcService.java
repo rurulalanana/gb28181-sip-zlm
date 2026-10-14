@@ -1,5 +1,6 @@
 package io.github.rurulalanana.gb28181.sip.zlm;
 
+import com.aizuda.zlm4j.callback.IMKWebRtcGetAnwerSdpCallBack;
 import com.aizuda.zlm4j.core.ZLMApi;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,10 +42,10 @@ public class WebRtcService {
      * 交换 SDP：返回 ZLM 生成的 answer。
      *
      * @param peerId   对端标识（浏览器自定义，同一浏览器页面保持一致即可）
-     * @param app      ZLM 应用名
-     * @param stream   流名（GB28181 场景为通道编码）
+     * @param app      ZLM 应用名（= 设备编码）
+     * @param stream   流名（= 通道编码）
      * @param offerSdp 浏览器生成的 offer
-     * @param timeoutSeconds 等待 answer 的超时
+     * @param timeoutSeconds 等待 answer 的秒数（<b>下限</b>）
      */
     public String exchange(String peerId, String app, String stream, String offerSdp, int timeoutSeconds)
             throws Exception {
@@ -54,26 +55,52 @@ public class WebRtcService {
         Peer peer = new Peer(peerId, answer);
         peers.put(peerId, peer);
 
-        String url = "webrtc://127.0.0.1:" + mediaServer.getRtcPort() + "/" + app + "/" + stream;
-        // mk_webrtc_get_answer_sdp(user_data, callback, type, peer, offer)
-        api.mk_webrtc_get_answer_sdp(null,
-                (ptr, sdp, err) -> {
-                    if (sdp != null && !sdp.isEmpty()) {
-                        answer.complete(sdp);
-                    } else {
-                        answer.completeExceptionally(new IllegalStateException(
-                                "ZLM 生成 answer 失败: " + (err == null ? "未知错误" : err)
-                                        + "（请确认 WebRTC 端口已启动、流存在：" + url + "）"));
-                    }
-                },
-                TYPE_PLAY, peerId, offerSdp);
+        // mk_webrtc_get_answer_sdp(user_data, cb, type, offer, url)
+        // 第 4 个参数是浏览器 offer SDP，第 5 个是 rtc://vhost/app/stream 逻辑地址。
+        // 两者都是 String，位置传反不会编译报错，但原生侧会把 peerId 当 SDP 解析 →
+        // java.lang.Error: Invalid memory access。
+        //
+        // url 必须与已注册媒体源完全一致（ZLM 内部 MediaInfo 解析后 findAsync 找 RTSP 源）。
+        // 建流时已固定 app=设备编码、stream=通道编码，命名确定，直接拼即可。
+        //
+        // JNA 只以 WeakHashMap 弱引用登记回调，Java 侧不强引用则回调可能在原生
+        // 线程回调前被 GC（原生 trampoline 一并回收 → 崩溃或 answer 永远不返回）。
+        // 故由 Peer 持有强引用，随 peers.remove 一同释放（对应 zlm4j 开发规范：
+        // 常驻内存的 native 资源需由 Java 侧持有并提供释放方法）。
+        final String rtcUrl = mediaServer.resolveRtcUrl(app, stream);
+        IMKWebRtcGetAnwerSdpCallBack onAnswer = (ptr, sdp, err) -> {
+            if (sdp != null && !sdp.isEmpty()) {
+                answer.complete(sdp);
+            } else {
+                answer.completeExceptionally(new IllegalStateException(
+                        "ZLM 生成 answer 失败: " + (err == null ? "未知错误" : err)
+                                + "（协商地址 " + rtcUrl + "，请确认该流已建立）"));
+            }
+        };
+        peer.setCallback(onAnswer);
+        // 与 ZlmMediaServer 事件回调同理：先固定线程再交给原生侧，
+        // 否则 JNA 会在回调结束后尝试 detach 失败，往 stderr 打「could not detach thread」
+        ZlmMediaServer.pinCallbackThread(onAnswer);
+        api.mk_webrtc_get_answer_sdp(null, onAnswer, TYPE_PLAY, offerSdp, rtcUrl);
 
+        // ZLM 的 play 插件内部走 MediaSource::findAsync：源不存在时不会立刻失败，而是
+        // 挂到媒体注册事件上等流上线，最多等 general.maxStreamWaitMS 才回调
+        // 「stream not found」。等待时间必须比它长，否则只能拿到 TimeoutException，
+        // 看不到 ZLM 的真实原因。故这里取两者较大值，再加 3s 余量。
+        int waitSeconds = Math.max(timeoutSeconds, mediaServer.getMaxStreamWaitMs() / 1000 + 3);
         try {
-            String result = answer.get(timeoutSeconds, TimeUnit.SECONDS);
+            String result = answer.get(waitSeconds, TimeUnit.SECONDS);
             log.info("WebRTC SDP 交换完成: peer={} stream={}/{}", peerId, app, stream);
             return result;
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new IllegalStateException("ZLM 在 " + waitSeconds + " 秒内未返回 answer（地址 " + rtcUrl
+                    + "）。请确认该流已注册：设备是否已应答 INVITE 并发送 RTP。");
         } finally {
-            peers.remove(peerId);
+            Peer removed = peers.remove(peerId);
+            if (removed != null) {
+                // 交换已结束（成功/超时/异常），回调不会再触发，释放强引用
+                removed.setCallback(null);
+            }
         }
     }
 
@@ -81,10 +108,16 @@ public class WebRtcService {
     private static final class Peer {
         final String peerId;
         final CompletableFuture<String> answer;
+        /** 见 {@link #exchange}：JNA 不持有回调强引用，必须由本对象兜住。 */
+        private volatile IMKWebRtcGetAnwerSdpCallBack callback;
 
         Peer(String peerId, CompletableFuture<String> answer) {
             this.peerId = peerId;
             this.answer = answer;
+        }
+
+        void setCallback(IMKWebRtcGetAnwerSdpCallBack callback) {
+            this.callback = callback;
         }
     }
 

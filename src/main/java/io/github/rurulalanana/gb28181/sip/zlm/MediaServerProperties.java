@@ -112,6 +112,32 @@ public class MediaServerProperties {
     @Builder.Default
     private final int rtpPortRangeEnd = 0;
 
+    /**
+     * 单端口收流模式（默认关闭，保持每通道独占端口）。
+     *
+     * <p>开启后所有设备推流到<b>同一个端口</b>，ZLM 按 RTP 头里的 SSRC 分流，
+     * 端口数不再受 ZLM 内置端口池（{@code [30000,35000]}，仅 2500 对）限制，
+     * 防火墙也只需放行一个端口。
+     *
+     * <p><b>代价</b>（ZLM 单端口分支不创建 {@code RtcpHelper} 所致）：
+     * <ul>
+     *   <li>RTCP 收发失效，{@code mk_media_source_get_track_loss} 之外的丢包统计不可用</li>
+     *   <li>{@code mk_rtp_server_set_on_detach2} 不触发——RTP 超时后 ZLM 销毁的是
+     *       单个 SSRC 的 {@code RtpProcess}，平台需改由流下线事件感知</li>
+     *   <li>{@code mk_rtp_server_update_ssrc} 无效，无法做 SSRC 过滤</li>
+     * </ul>
+     *
+     * <p>流名由 {@code stream_replace} 归一为 {@code <设备编码>_<通道编码>}
+     * （见 {@code RtpSession#getStream()}），因此上游业务（播放地址、媒体源定位、
+     * 录像索引）无需感知端口差异。
+     */
+    @Builder.Default
+    private final boolean rtpSinglePort = false;
+
+    /** 单端口模式下的收流端口（UDP 与 TCP 被动共用同一端口号）。 */
+    @Builder.Default
+    private final int rtpSinglePortNumber = 24560;
+
     /** ZLM 虚拟主机名（默认虚拟主机）。 */
     @Builder.Default
     private final String vhost = "__defaultVhost__";

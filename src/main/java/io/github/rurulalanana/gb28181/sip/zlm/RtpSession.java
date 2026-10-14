@@ -1,5 +1,6 @@
 package io.github.rurulalanana.gb28181.sip.zlm;
 
+import com.aizuda.zlm4j.callback.IMKRtpServerDetachCallBack;
 import com.aizuda.zlm4j.structure.MK_RTP_SERVER;
 
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -7,8 +8,26 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 一路 GB28181 收流会话。
  *
- * <p>一个会话对应 ZLM 中一个独占端口的 RTP 服务器（{@code mk_rtp_server_create2}），
- * 生命周期：协商中（{@link #NEGOTIATING}）→ 有流（{@link #ONLINE}）→ 已关闭（{@link #CLOSED}）。
+ * <p>生命周期：协商中（{@link #NEGOTIATING}）→ 有流（{@link #ONLINE}）→ 已关闭（{@link #CLOSED}）。
+ *
+ * <p><b>唯一标识是「设备编码 + 通道编码」</b>（{@link #getSessionKey()}），
+ * 不是裸通道编码——通道编码只在单设备内唯一，跨设备会重复。
+ *
+ * <p><b>逻辑标识与 ZLM 命名是两套坐标</b>：
+ * <ul>
+ *   <li>{@link #getSessionKey()} = {@code <设备编码>/<通道编码>}，业务侧唯一键
+ *       （数据库 {@code gb_stream.stream_key}、接口返回、日志），<b>不随收流模式变化</b>。</li>
+ *   <li>{@link #getZlmApp()} / {@link #getStream()} = ZLM 媒体源的实际 {@code app/stream}，
+ *       由收流模式决定：
+ *       <ul>
+ *         <li>独占端口（默认）：{@code app=设备编码}、{@code stream=通道编码}</li>
+ *         <li>单端口：{@code app=rtp}（ZLM 固定值）、{@code stream=<设备编码>_<通道编码>}
+ *             （由 {@code stream_replace} 改名而来，否则会是 SSRC 的十六进制）</li>
+ *       </ul>
+ *   </li>
+ * </ul>
+ * 两套坐标分开的原因：单端口模式下 ZLM 的 app 是写死的 {@code rtp}，无法承载设备编码，
+ * 若让 {@link #getSessionKey()} 跟着变，数据库键与接口契约都会被收流模式污染。
  *
  * <p>会话对象同时强引用 JNA detach 回调，防止回调被 GC 后原生侧调用崩溃。
  */
@@ -21,12 +40,39 @@ public class RtpSession {
     /** 会话已关闭（BYE / 主动停止）。 */
     public static final String CLOSED = "CLOSED";
 
-    /** 通道编码（GB28181 DeviceID，同时作为 ZLM 流名）。 */
+    /** 通道编码（GB28181 DeviceID，作为 ZLM 的<b>流名</b>）。 */
     private final String channelId;
 
-    /** ZLM RTP 会话序号（同一通道多次点播时递增）。 */
-    private final int streamIndex;
-    /** 设备编码（SIP 层设备 ID，可能与通道相同）。 */
+    /**
+     * ZLM 应用名。
+     *
+     * <p>独占端口模式下是<b>设备编码</b>；单端口模式下是 ZLM 写死的 {@code rtp}
+     * （复用分支的 tuple 来自 server 级默认值，{@code stream_replace} 改不到 app）。
+     *
+     * <p><b>为什么独占端口要用设备编码而不是固定 app</b>：通道编码只在单个设备内唯一，
+     * 不同设备可以出现相同通道编码（标准只保证设备编码全局唯一）。
+     * 若 ZLM 命名空间只用通道编码，两台设备点播同号通道时会撞在同一个
+     * {@code app/stream} 上——后建的流会因 {@code media source already existed}
+     * 注册失败，两台设备的会话互相顶掉。
+     *
+     * <p>注意：这是 <b>ZLM 侧</b>的命名，与业务侧唯一键 {@link #getSessionKey()} 无关。
+     */
+    private final String zlmApp;
+
+    /**
+     * ZLM 流名。
+     *
+     * <p>独占端口模式下是<b>通道编码</b>；单端口模式下是
+     * {@code <设备编码>_<通道编码>}（由推流回调经 {@code stream_replace} 归一，
+     * 否则 ZLM 会用 SSRC 的十六进制串当流名）。
+     *
+     * <p><b>不含会话序号</b>：同一通道重复点播时 ZLM 复用的是同一个
+     * {@code app/stream}（旧源先被关闭），流名恒定。历史上曾拼过
+     * {@code <channelId>/<序号>}，那是把 {@code stream_id} 误当成 ssrc 过滤器的产物。
+     */
+    private final String zlmStream;
+
+    /** 设备编码（SIP 层设备 ID）。 */
     private final String deviceId;
     /** 平台侧 SSRC（SDP {@code y=} 行，按设备编码生成）。 */
     private final String ssrc;
@@ -57,18 +103,42 @@ public class RtpSession {
     private final AtomicBoolean detached = new AtomicBoolean(false);
     private final long createdAt = System.currentTimeMillis();
 
-    public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
-                      int tcpMode, String callId, MK_RTP_SERVER handle, int port,
-                      MediaType type, String mediaUri) {
-        this(channelId, deviceId, ssrc, deviceSsrc, tcpMode, callId, handle, port, type, mediaUri, 0);
-    }
+    /**
+     * JNA detach 回调的强引用。
+     *
+     * <p><b>为什么必须持有</b>：JNA 只以 {@code WeakHashMap} 弱引用登记回调
+     * （{@code CallbackReference extends WeakReference<Callback>}），回调对象一旦
+     * 被 GC，JNA 会回收其原生 trampoline，原生侧再调用即崩溃或静默丢失。
+     * 对应 zlm4j 开发规范：常驻内存的 native 资源需由 Java 侧持有并提供释放方法。
+     *
+     * <p>生命周期与 ZLM RTP 服务器一致：创建会话时置入，
+     * release / detach 后由 {@link #clearDetachCallback()} 清空。
+     */
+    private volatile IMKRtpServerDetachCallBack detachCallback;
 
     public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
                       int tcpMode, String callId, MK_RTP_SERVER handle, int port,
-                      MediaType type, String mediaUri, int streamIndex) {
+                      MediaType type, String mediaUri) {
+        this(channelId, deviceId, ssrc, deviceSsrc, tcpMode, callId, handle, port,
+                type, mediaUri, null, null);
+    }
+
+    /**
+     * 完整构造。
+     *
+     * @param zlmApp    ZLM 应用名；{@code null} 表示按独占端口模式取设备编码
+     * @param zlmStream ZLM 流名；{@code null} 表示按独占端口模式取通道编码
+     */
+    public RtpSession(String channelId, String deviceId, String ssrc, String deviceSsrc,
+                      int tcpMode, String callId, MK_RTP_SERVER handle, int port,
+                      MediaType type, String mediaUri, String zlmApp, String zlmStream) {
         this.channelId = channelId;
-        this.streamIndex = streamIndex;
         this.deviceId = deviceId;
+        // 设备编码缺失时退回通道编码：单设备场景下二者相同，
+        // 至少保证 app 非空（ZLM 要求 app/stream 均非空）
+        String fallbackApp = (deviceId == null || deviceId.isBlank()) ? channelId : deviceId;
+        this.zlmApp = (zlmApp == null || zlmApp.isBlank()) ? fallbackApp : zlmApp;
+        this.zlmStream = (zlmStream == null || zlmStream.isBlank()) ? channelId : zlmStream;
         this.ssrc = ssrc;
         this.deviceSsrc = deviceSsrc;
         this.tcpMode = tcpMode;
@@ -143,25 +213,37 @@ public class RtpSession {
         return createdAt;
     }
 
-    /**
-     * ZLM 流名（GB28181 场景）。
-     *
-     * <p>注意：ZLMediaKit 的 {@code mk_rtp_server_create2} 会把 RTP 会话
-     * 注册为 {@code <channelId>/0}（实测注册日志恒为
-     * {@code rtsp://__defaultVhost__/34020000001310000001/0}），
-     * 而非传入的裸 channelId。
-     *
-     * <p><b>序号恒为 0</b>：该序号是 ZLM 内部按 RTP 服务器句柄独立编号的，
-     * 同一设备重复点播不会累加。曾误用全局自增计数器，导致返回
-     * {@code /1}、{@code /4} 等地址，而实际流始终是 {@code /0}。
-     */
+    /** ZLM 流名，见 {@link #zlmStream}。 */
     public String getStream() {
-        return channelId + "/" + streamIndex;
+        return zlmStream;
     }
 
-    /** 裸通道编码（用于按通道查会话，不是 ZLM 流名）。 */
-    public String getChannelIdForLookup() {
-        return channelId;
+    /**
+     * ZLM 应用名，见 {@link #zlmApp}。
+     *
+     * <p>与 {@link #getStream()} 一起构成 ZLM 媒体源的唯一标识，
+     * 也是 {@code mk_media_source_for_each} / {@code close_streams} 的定位参数。
+     */
+    public String getZlmApp() {
+        return zlmApp;
+    }
+
+    /**
+     * 会话唯一键：{@code <设备编码>/<通道编码>}。
+     *
+     * <p><b>这是业务侧坐标，不是 ZLM 的 {@code app/stream}</b>：单端口模式下
+     * ZLM 的 app 固定为 {@code rtp}、stream 为 {@code <设备>_<通道>}，
+     * 但本键恒定不变，数据库 {@code gb_stream.stream_key} 与接口返回都依赖它。
+     *
+     * <p>不可退化成裸通道编码：通道编码只在设备内唯一，跨设备会重复（见 {@link #zlmApp}）。
+     */
+    public String getSessionKey() {
+        return zlmAppOf(deviceId, channelId) + "/" + channelId;
+    }
+
+    /** 设备编码归一（缺失时退回通道编码，保证非空）。 */
+    private static String zlmAppOf(String deviceId, String channelId) {
+        return (deviceId == null || deviceId.isBlank()) ? channelId : deviceId;
     }
 
     /**
@@ -182,13 +264,28 @@ public class RtpSession {
         return detached.compareAndSet(false, true);
     }
 
+    /** 置入 JNA detach 回调强引用（见 {@link #detachCallback}）。 */
+    public void setDetachCallback(IMKRtpServerDetachCallBack callback) {
+        this.detachCallback = callback;
+    }
+
+    /**
+     * 释放 JNA detach 回调强引用。
+     *
+     * <p>RTP 服务器销毁后回调不会再触发，此处清空让回调对象可被回收
+     * （JNA 的 Cleaner 会随之释放原生 trampoline）。
+     */
+    public void clearDetachCallback() {
+        this.detachCallback = null;
+    }
+
     public boolean isDetached() {
         return detached.get();
     }
 
     @Override
     public String toString() {
-        return "RtpSession{channel=" + channelId + ", type=" + type + ", port=" + port
+        return "RtpSession{key=" + getSessionKey() + ", type=" + type + ", port=" + port
                 + ", ssrc=" + ssrc + ", tcp=" + (tcpMode == 1) + ", state=" + state + '}';
     }
 }

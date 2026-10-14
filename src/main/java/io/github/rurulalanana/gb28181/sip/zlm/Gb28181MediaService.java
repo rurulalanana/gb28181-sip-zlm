@@ -160,10 +160,11 @@ public class Gb28181MediaService implements SipCallback {
             client().respondInvite(event.getRawRequestEvent(), answer);
             log.info("已应答 INVITE(200 OK): {} media={}:{} playUrls={}",
                     session, props.getMediaIp(), session.getPort(),
-                    mediaServer.playUrls(session.getStream()));
+                    mediaServer.playUrls(session));
         } catch (Exception e) {
-            log.error("处理 INVITE 失败: channel={} callId={}", channelId, event.getCallId(), e);
-            sessionManager.closeByChannel(channelId);
+            log.error("处理 INVITE 失败: device={} channel={} callId={}",
+                    peerId, channelId, event.getCallId(), e);
+            sessionManager.closeByChannel(peerId, channelId);
             reject(event, SDP_NOT_ACCEPTABLE);
         }
     }
@@ -213,10 +214,12 @@ public class Gb28181MediaService implements SipCallback {
         }
 
         // 补发 ACK 完成握手
+        // 必须传通道编码：ACK 在 INVITE 对话框内，Request-URI/To 需与原 INVITE 一致，
+        // 否则部分设备匹配不到对话框而丢弃 ACK，表现为「回了 200 OK 但不推流」
         String toTag = toTagOf(response);
         sessionManager.bindToTag(session, toTag);
         try {
-            client().ackInvite(session.getDeviceId(), callId, toTag, null);
+            client().ackInvite(session.getDeviceId(), session.getChannelId(), callId, toTag, null);
             log.info("INVITE 已被设备接受，已回 ACK: {} toTag={}", session, toTag);
         } catch (Exception e) {
             log.error("回 ACK 失败: {}", session, e);
@@ -246,8 +249,13 @@ public class Gb28181MediaService implements SipCallback {
             cascadeForwarder.stopForward(event.getCallId());
             return;
         }
+        // 无 Call-ID 索引时退化为按「设备编码 + 通道编码」定位
         String channelId = resolveChannelId(event);
-        if (sessionManager.getByChannel(channelId) != null) {
+        String peerId = event.getPeer() == null ? null : event.getPeer().getDeviceId();
+        if (peerId != null) {
+            sessionManager.closeByChannel(peerId, channelId);
+        } else {
+            // 设备编码缺失（罕见）：按通道关闭，可能命中多台设备的同号通道
             sessionManager.closeByChannel(channelId);
         }
     }
@@ -262,12 +270,21 @@ public class Gb28181MediaService implements SipCallback {
 
     // ==================== 平台主动：实时 / 回放 / 下载 ====================
 
-    /** 平台主动实时点播（标准 9.2）。 */
-    public RtpSession play(String deviceId) {
-        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+    /**
+     * 平台主动实时点播（标准 9.2）。
+     *
+     * @param deviceId  设备编码（SIP 目标，必须全局唯一）
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示点播设备自身
+     */
+    public RtpSession play(String deviceId, String channelId) {
+        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.REALTIME, null);
         SdpMessage offer = buildAnswerSdp(session, false);
-        String callId = client().invitePlay(deviceId, offer);
+        // 标准 9.2：Request-URI / To / Subject 都要填「被点播的通道编码」，
+        // 不能填设备编码 —— 设备会在自己的通道列表里找这个编码，
+        // 找不到就静默丢弃（模拟器不校验，所以只有真实设备/下级平台会暴露）
+        String callId = client().invitePlay(deviceId, channel, offer);
         sessionManager.bindCallId(session, callId);
         log.info("已发起点播 INVITE: {} media={}:{} callId={}",
                 session, props.getMediaIp(), session.getPort(), callId);
@@ -275,35 +292,64 @@ public class Gb28181MediaService implements SipCallback {
     }
 
     /**
+     * 平台主动实时点播（设备直连：设备编码即通道编码）。
+     *
+     * <p>适用于直连摄像机或设备自身就是一路通道的场景；
+     * 下挂子通道请用 {@link #play(String, String)}。
+     */
+    public RtpSession play(String deviceId) {
+        return play(deviceId, deviceId);
+    }
+
+    /**
      * 平台主动历史回放（标准 9.8）。
      *
-     * @param deviceId 设备/通道编码
-     * @param item     {@link #queryRecordInfo} 检索到的录像段
+     * @param deviceId  设备编码（SIP 目标）
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示设备自身
+     * @param item      {@link #queryRecordInfo} 检索到的录像段
      */
-    public RtpSession playback(String deviceId, RecordItem item) {
-        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+    public RtpSession playback(String deviceId, String channelId, RecordItem item) {
+        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.PLAYBACK, item.getFilePath());
         SdpMessage offer = buildPlaybackSdp(session, item);
-        String callId = client().invitePlayback(deviceId, offer);
+        // 同实时点播：Request-URI / To / Subject 填通道编码
+        String callId = client().invitePlayback(deviceId, channel, offer);
         sessionManager.bindCallId(session, callId);
-        log.info("已发起回放 INVITE: channel={} file={} callId={} playUrls={}",
-                deviceId, item.getFilePath(), callId, mediaServer.playUrls(session.getStream()));
+        log.info("已发起回放 INVITE: {} file={} callId={} playUrls={}",
+                session, item.getFilePath(), callId, mediaServer.playUrls(session));
         return session;
+    }
+
+    /** 平台主动历史回放（设备直连：设备编码即通道编码）。 */
+    public RtpSession playback(String deviceId, RecordItem item) {
+        return playback(deviceId, deviceId, item);
     }
 
     /**
      * 平台主动文件下载（标准 9.9）：设备把文件流推到平台收流端口。
      *
-     * @param filePath 设备侧文件路径（来自 RecordInfo 的 FilePath）
+     * @param deviceId  设备编码（SIP 目标）
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示设备自身
+     * @param filePath  设备侧文件路径（来自 RecordInfo 的 FilePath）
      */
-    public RtpSession download(String deviceId, String filePath) {
-        RtpSession session = sessionManager.open(deviceId, deviceId, null, 0, null,
+    public RtpSession download(String deviceId, String channelId, String filePath) {
+        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.DOWNLOAD, filePath);
         SdpMessage offer = buildAnswerSdp(session, false);
-        String callId = client().invite(deviceId, offer, subjectFor(deviceId));
+        // Subject 传 null：由 sip 模块按标准生成
+        // <通道编码>:<SSRC>,<平台编码>:0（此处 SDP 的 y= 已由 buildAnswerSdp 填好）
+        String callId = client().invite(deviceId, channel, offer, null);
         sessionManager.bindCallId(session, callId);
-        log.info("已发起下载 INVITE: channel={} file={} callId={}", deviceId, filePath, callId);
+        log.info("已发起下载 INVITE: {} file={} callId={}",
+                session, filePath, callId);
         return session;
+    }
+
+    /** 平台主动文件下载（设备直连：设备编码即通道编码）。 */
+    public RtpSession download(String deviceId, String filePath) {
+        return download(deviceId, deviceId, filePath);
     }
 
     /**
@@ -327,14 +373,42 @@ public class Gb28181MediaService implements SipCallback {
         if (command == PlaybackCommand.SPEED) {
             sdp.attr("Scale: " + scale);
         }
-        client().info(deviceId, callId, sdp);
+        // 通道编码从会话取：INFO 必须在 INVITE 对话框内（RFC 2976），
+        // Request-URI / To 要与回放 INVITE 一致（都是通道编码），
+        // 而调用方只持有 callId 与设备编码，此处按 callId 反查通道
+        RtpSession session = sessionManager.getByCallId(callId);
+        String channel = session == null ? deviceId : session.getChannelId();
+        client().info(deviceId, channel, callId, sdp);
         log.info("发送回放控制: channel={} callId={} command={} scale={}",
-                deviceId, callId, command.command(), scale);
+                channel, callId, command.command(), scale);
     }
 
-    /** 停止某通道的点播（释放收流端口；BYE 由业务侧按需发送）。 */
-    public void stop(String deviceId) {
-        sessionManager.closeByChannel(deviceId);
+    /**
+     * 停止某会话的点播：发 BYE 让设备停止推流，再释放收流端口与媒体源。
+     *
+     * <p><b>必须先发 BYE</b>：仅释放本地收流端口不会通知设备，设备的 INVITE
+     * 会话仍然有效，会继续向上行推流（推到已释放的端口上被丢弃），白白占用带宽
+     * 直到设备侧超时。这一点与 {@link #onNoViewer} 一致。
+     *
+     * @param deviceId  设备编码
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示设备自身
+     * @return 是否找到并关闭了会话（会话不存在时返回 {@code false}）
+     */
+    public boolean stop(String deviceId, String channelId) {
+        String sessionKey = RtpSessionManager.sessionKey(deviceId, channelId);
+        RtpSession session = sessionManager.getByKey(sessionKey);
+        if (session == null || RtpSession.CLOSED.equals(session.getState())) {
+            log.debug("停止点播：未找到活跃会话: {}", sessionKey);
+            return false;
+        }
+        byeQuietly(session);
+        sessionManager.closeByKey(sessionKey);
+        return true;
+    }
+
+    /** 停止点播（设备直连：设备编码即通道编码）。 */
+    public boolean stop(String deviceId) {
+        return stop(deviceId, deviceId);
     }
 
     /**
@@ -346,13 +420,11 @@ public class Gb28181MediaService implements SipCallback {
      * <p>相比让 ZLM 直接 {@code mk_media_source_close}，走这里的好处是
      * 会发 SIP BYE 让设备停止推流，而不只是本地断开。
      *
-     * <p><b>必须同时传 app 与 stream</b>：ZLM 的流标识有两种布局
-     * （{@code app=rtp, stream=<通道>/<序号>} 与 {@code app=<通道>, stream=<序号>}），
-     * 只看 stream 会在后一种布局下拿到裸序号（如 {@code "0"}）而查不到会话，
-     * 表现为「日志打了『流无观看者』但流一直不关」。
+     * <p><b>必须同时传 app 与 stream</b>：两者共同定位唯一媒体源
+     * （{@code app=设备编码}、{@code stream=通道编码}）。
      *
-     * @param app    ZLM 应用名（可能是 {@code rtp}，也可能是通道编码）
-     * @param stream ZLM 流名（{@code <通道编码>/<序号>} 或裸序号）
+     * @param app    ZLM 应用名（= 设备编码）
+     * @param stream ZLM 流名（= 通道编码）
      * @return 是否找到并关闭了会话
      */
     public boolean onNoViewer(String app, String stream) {
@@ -363,25 +435,47 @@ public class Gb28181MediaService implements SipCallback {
             log.debug("无人观看，但未找到对应会话（可能已关闭）: app={} stream={}", app, stream);
             return false;
         }
-        String channelKey = session.getChannelId();
-        String callId = session.getCallId();
-        String deviceId = session.getDeviceId();
-        log.info("无人观看超时，关闭会话: channel={} device={} callId={}", channelKey, deviceId, callId);
-        try {
-            if (callId != null && deviceId != null) {
-                client().bye(deviceId, callId, session.getToTag());
-            }
-        } catch (Exception e) {
-            // BYE 失败不阻断本地会话释放
-            log.warn("发送 BYE 失败: device={} callId={}, {}", deviceId, callId, e.getMessage());
-        }
-        sessionManager.closeByChannel(channelKey);
+        log.info("无人观看超时，关闭会话: {}", session);
+        byeQuietly(session);
+        sessionManager.closeByKey(session.getSessionKey());
         return true;
     }
 
+    /**
+     * 尽力发送 BYE 释放设备带宽；失败只告警，不阻断本地资源释放。
+     *
+     * <p>三种情况会跳过：会话无 Call-ID（平台侧尚未回填）、无设备编码、
+     * 信令服务器未装配（{@code attach} 未调用）。
+     */
+    private void byeQuietly(RtpSession session) {
+        String callId = session.getCallId();
+        String deviceId = session.getDeviceId();
+        if (callId == null || deviceId == null || sipServer == null) {
+            return;
+        }
+        try {
+            // 传通道编码：BYE 与 INVITE 同属一个对话框，
+            // Request-URI / To 必须与原 INVITE 一致，否则设备忽略 BYE 继续推流
+            client().bye(deviceId, session.getChannelId(), callId, session.getToTag());
+        } catch (Exception e) {
+            log.warn("发送 BYE 失败: device={} callId={}, {}", deviceId, callId, e.getMessage());
+        }
+    }
+
+    /**
+     * 某通道当前会话的播放地址。
+     *
+     * @param deviceId  设备编码
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示设备自身
+     */
+    public PlayUrls playUrls(String deviceId, String channelId) {
+        RtpSession session = sessionManager.getByChannel(deviceId, channelId);
+        return session == null ? null : mediaServer.playUrls(session);
+    }
+
+    /** 某通道当前会话的播放地址（设备直连：设备编码即通道编码）。 */
     public PlayUrls playUrls(String deviceId) {
-        RtpSession session = sessionManager.getByChannel(deviceId);
-        return session == null ? null : mediaServer.playUrls(session.getStream());
+        return playUrls(deviceId, deviceId);
     }
 
     /**
@@ -590,10 +684,6 @@ public class Gb28181MediaService implements SipCallback {
         return proto != null && proto.toUpperCase().contains("TCP");
     }
 
-    private String subjectFor(String deviceId) {
-        return deviceId + ":" + props.getPlatformId() + ",0000000001:0000000001";
-    }
-
     /** 构造收流应答 SDP（实时 / 下载通用）：PS over RTP，{@code y=} 取会话 SSRC。 */
     SdpMessage buildAnswerSdp(RtpSession session, boolean tcp) {
         SdpMessage sdp = new SdpMessage()
@@ -617,9 +707,6 @@ public class Gb28181MediaService implements SipCallback {
         if (session.getMediaUri() != null) {
             sdp.uri(session.getMediaUri());
         }
-        if (tcp) {
-            sdp.setup("passive");
-        }
         return sdp;
     }
 
@@ -633,6 +720,7 @@ public class Gb28181MediaService implements SipCallback {
                 .uri(item.getFilePath())
                 .connection(props.getMediaIp())
                 .mediaPort(session.getPort())
+                .mediaProto(SdpMessage.PROTO_UDP)
                 .payloadType("96")
                 .rtpmap("96", "PS")
                 .ssrc(session.getSsrc());

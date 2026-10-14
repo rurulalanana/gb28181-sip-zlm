@@ -52,25 +52,37 @@ public class ZlmMediaServerTest {
             assertTrue("RTSP 端口应生效", server.getRtspPort() == RTSP_PORT);
             assertTrue("WebRTC 端口应生效", server.getRtcPort() == RTC_PORT);
 
-            // UDP 模式，port=0 让 ZLM 随机分配，ssrc="0" 不过滤
+            // UDP 模式，port=0 让 ZLM 随机分配。
+            // 参数序：mk_rtp_server_create2(port, tcp_mode, vhost, app, stream_id)
+            // app = 设备编码，stream_id = 通道编码
             MK_RTP_SERVER handle = ZlmMediaServer.api().mk_rtp_server_create2(
-                    (short) 0, 0, "rtp", "smoke-cam-1", "0");
+                    (short) 0, 0, "__defaultVhost__", "smoke-dev-1", "smoke-cam-1");
             assertNotNull("RTP 服务器应创建成功", handle);
             int port = ZlmMediaServer.api().mk_rtp_server_port(handle) & 0xFFFF;
             assertTrue("RTP 端口应大于 0: " + port, port > 0);
 
-            // TCP 被动模式 + 指定 SSRC 过滤
+            // SSRC 过滤走独立接口（create2 没有 ssrc 参数）
+            ZlmMediaServer.api().mk_rtp_server_update_ssrc(handle, 1234567890);
+
+            // TCP 被动模式
             MK_RTP_SERVER tcpHandle = ZlmMediaServer.api().mk_rtp_server_create2(
-                    (short) 0, 1, "rtp", "smoke-cam-2", "1234567890");
+                    (short) 0, 1, "__defaultVhost__", "smoke-dev-2", "smoke-cam-2");
             assertNotNull("TCP RTP 服务器应创建成功", tcpHandle);
             assertTrue("TCP RTP 端口应大于 0",
                     (ZlmMediaServer.api().mk_rtp_server_port(tcpHandle) & 0xFFFF) > 0);
 
-            PlayUrls urls = server.playUrls("smoke-cam-1");
-            assertTrue(urls.getHttpFlv().contains("smoke-cam-1.live.flv"));
-            // 嵌入式 ZLM 下 app 不进URL 路径，故不含 /rtp/
-            assertTrue(urls.getRtmp().contains("/smoke-cam-1"));
-            assertFalse("RTMP 地址不应含 app 前缀", urls.getRtmp().contains("/rtp/"));
+            // 播放地址路径必须是 app/stream（app=设备编码、stream=通道编码）
+            PlayUrls urls = server.playUrls("smoke-dev-1", "smoke-cam-1");
+            assertTrue("HTTP-FLV 应含 app/stream: " + urls.getHttpFlv(),
+                    urls.getHttpFlv().contains("/smoke-dev-1/smoke-cam-1.live.flv"));
+            assertTrue("RTMP 应含 app/stream: " + urls.getRtmp(),
+                    urls.getRtmp().contains("/smoke-dev-1/smoke-cam-1"));
+            assertTrue("RTSP 应含 app/stream: " + urls.getRtsp(),
+                    urls.getRtsp().contains("/smoke-dev-1/smoke-cam-1"));
+
+            // WebRTC 协商地址同样要带 app/stream
+            assertEquals("rtc://__defaultVhost__/smoke-dev-1/smoke-cam-1",
+                    server.resolveRtcUrl("smoke-dev-1", "smoke-cam-1"));
 
             ZlmMediaServer.api().mk_rtp_server_release(handle);
             ZlmMediaServer.api().mk_rtp_server_release(tcpHandle);

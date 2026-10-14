@@ -6,6 +6,10 @@ import io.github.rurulalanana.gb28181.sip.security.CredentialProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 /**
  * GB28181 流媒体平台组合根：信令（gb28181-sip）+ 媒体（ZLMediaKit）一把启动。
  *
@@ -39,6 +43,19 @@ public class Gb28181MediaPlatform implements AutoCloseable {
     private WebRtcService webRtcService;
     private Gb28181SipServer sipServer;
 
+    /**
+     * 无人观看关流线程池；{@link #start()} 创建、{@link #stop()} 关闭。
+     *
+     * <p>ZLM 的无人观看回调是<b>同步派发</b>在它自己的 event poller 线程上的
+     * （{@code NoticeCenter::emitEvent} 内联调用所有监听者），回调返回后 ZLM 还要
+     * 继续用它自己的对象。而关流动作包含 SIP BYE（网络 I/O）与遍历注销媒体源，
+     * 耗时且会阻塞该线程，因此必须异步执行，回调里只做入队。
+     *
+     * <p>用固定 2 线程而非单线程：关流可能涉及多个协议实例，单线程会让
+     * 后到的请求排队；也不宜过多，避免大量设备同时超时时打爆 SIP 栈。
+     */
+    private volatile ExecutorService noReaderExecutor;
+
     public Gb28181MediaPlatform(MediaServerProperties props) {
         this.props = props == null ? MediaServerProperties.builder().build() : props;
     }
@@ -48,6 +65,12 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         if (mediaServer != null) {
             return;
         }
+        // 关流线程池先建：无人观看回调注册时就要用到
+        noReaderExecutor = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "gb28181-no-reader");
+            t.setDaemon(true);
+            return t;
+        });
         // 1. 媒体服务（ZLMediaKit）
         mediaServer = new ZlmMediaServer(props);
         mediaServer.start();
@@ -73,15 +96,31 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         // 无人观看自动关流：ZLM 判定超时后回调，此处发 BYE 并释放会话。
         // 不让 ZLM 直接关流（forceClose 保持 false），因为还需通知 SIP 侧释放设备带宽。
         // 回调必须透传 app：ZLM 的流标识有两种布局，只给 stream 会拿到裸序号而查不到会话。
+        //
+        // 回调运行在 ZLM 的 event poller 线程上，且是同步派发（NoticeCenter::emitEvent）。
+        // 而 onNoViewer 内部要发 SIP BYE（网络 I/O）并遍历注销媒体源，绝不能占用该线程：
+        // 一旦同步阻塞，ZLM 的 Timer lambda 会在事件返回后继续调用 MediaSource::getMuxer()，
+        // 此时监听者已被我们关掉，于是抛 "MediaSourceEvent is empty"（见 forwardZlmLog 注释）。
+        // 因此这里只做入队，实际关闭交给独立线程。
         mediaServer.setForceCloseOnNoReader(false);
         mediaServer.setNoReaderListener(new ZlmMediaServer.NoReaderListener() {
             @Override
             public void onNoReader(String app, String stream, String schema) {
-                try {
-                    mediaService.onNoViewer(app, stream);
-                } catch (Throwable t) {
-                    log.warn("无人观看关流失败: app={} stream={}", app, stream, t);
+                ExecutorService executor = noReaderExecutor;
+                // 捕获为局部变量：任务在别的线程执行，期间 stop() 可能把字段置 null
+                Gb28181MediaService svc = mediaService;
+                if (executor == null || executor.isShutdown() || svc == null) {
+                    // 平台正在停止：此时会话会被 closeAll 统一清理，无需再关流
+                    log.debug("平台已停止，忽略无人观看事件: app={} stream={}", app, stream);
+                    return;
                 }
+                executor.execute(() -> {
+                    try {
+                        svc.onNoViewer(app, stream);
+                    } catch (Throwable t) {
+                        log.warn("无人观看关流失败: app={} stream={}", app, stream, t);
+                    }
+                });
             }
         });
 
@@ -163,6 +202,21 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         broadcastService = null;
         webRtcService = null;
         sipServer = null;
+        // 关流线程池最后关：前面的 closeAll 会触发 onSessionClosed 回调，
+        // 可能还有排队中的关流任务需要跑完
+        ExecutorService executor = noReaderExecutor;
+        noReaderExecutor = null;
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(3, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
         log.info("GB28181 流媒体平台已停止");
     }
 

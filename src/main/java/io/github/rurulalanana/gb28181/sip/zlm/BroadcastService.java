@@ -105,8 +105,13 @@ public class BroadcastService {
         }
     }
 
-    /** 广播流的播放地址（上行收流后前端收听用）。 */
-    public PlayUrls playUrls(String deviceId) {
-        return mediaServer.playUrls(deviceId);
+    /**
+     * 广播流的播放地址（上行收流后前端收听用）。
+     *
+     * @param deviceId  设备编码（= ZLM app）
+     * @param channelId 通道编码（= ZLM stream）
+     */
+    public PlayUrls playUrls(String deviceId, String channelId) {
+        return mediaServer.playUrls(deviceId, channelId);
     }
 }

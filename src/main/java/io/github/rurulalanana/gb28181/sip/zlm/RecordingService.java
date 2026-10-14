@@ -182,7 +182,7 @@ public class RecordingService implements ZlmMediaServer.StreamListener {
         ZlmMediaServer.api().mk_proxy_player_play(player, props.getApp() + "/" + streamId);
         players.put(streamId, player);
         log.info("录像点播已启动: {} -> {}/{}", recording.getFilePath(), props.getApp(), streamId);
-        return mediaServer.playUrls(streamId);
+        return mediaServer.playUrls(props.getApp(), streamId);
     }
 
     /** 停止录像点播。 */
