@@ -14,11 +14,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * WebRTC 播放信令：浏览器 offer ↔ ZLMediaKit answer。
  *
- * <p><b>为什么需要它</b>：ZLMediaKit 的 {@code /index/api/*} 与
- * {@code /app/…live.flv} 等 HTTP 路由都由 <b>MediaServer 可执行文件</b>注册，
- * C API 嵌入方（zlm4j）里这些路由不存在——嵌入式模式下浏览器无法直接拉 FLV/HLS。
- * WebRTC 不依赖 HTTP 路由，只需交换一次 SDP 即可，因此是<b>嵌入式模式唯一能直接在
- * 浏览器里出画面的协议</b>。
+ * <p><b>为什么需要它</b>：ZLMediaKit 的 {@code /index/api/*} 管理 API 由
+ * <b>MediaServer 可执行文件</b>注册，C API 嵌入方（zlm4j）里这些路由不存在。
+ * 但 {@code ws://<host>:<httpPort>/<app>/<stream>.live.flv}（WebSocket-FLV）
+ * 由 ZLM 内置 HTTP 服务直接提供，嵌入式模式下同样可用（实测握手成功）；
+ * WebRTC 则提供更低延迟（&lt;500ms）的通路，代价是需浏览器与平台网络可直连
+ * （无 ICE 服务时不能跨 NAT）。
  *
  * <p>用法：浏览器 {@code POST /webrtc/play?peerId=x} 带 offer SDP，拿到 answer 后
  * {@code setRemoteDescription} 并回传 answer。

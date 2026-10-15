@@ -155,6 +155,40 @@ public class RecordingService implements ZlmMediaServer.StreamListener {
         return index.get(recordId);
     }
 
+    /**
+     * 按外部元数据重新登记一段历史录像（用于进程重启后恢复点播能力）。
+     *
+     * <p>内存索引重启即空，但录像文件与数据库记录仍在。上层（如 Spring 平台）
+     * 可从库中读出 {@code filePath/startTime} 后调用本方法把条目装回索引，
+     * 之后 {@link #playUrl(Recording)} 即可正常点播。
+     *
+     * @param recordId  录像 ID（与库中一致）
+     * @param channelId 通道编码
+     * @param filePath  录像文件绝对路径
+     * @param startTime 录像开始时间（epoch ms）
+     * @return 登记后的录像条目；文件不存在时返回 {@code null}
+     */
+    public Recording register(String recordId, String channelId, String filePath, long startTime) {
+        if (recordId == null || recordId.isEmpty() || filePath == null || filePath.isEmpty()) {
+            return null;
+        }
+        File file = new File(filePath);
+        if (!file.exists()) {
+            log.warn("登记历史录像失败，文件不存在: {}", filePath);
+            return null;
+        }
+        Recording existing = index.get(recordId);
+        if (existing != null) {
+            return existing;
+        }
+        Recording recording = new Recording(recordId, channelId, props.getApp(), channelId,
+                file.getAbsolutePath(), fileUrl(file.getName()), startTime);
+        recording.close(file.lastModified());
+        index.put(recordId, recording);
+        log.info("已登记历史录像: id={} file={}", recordId, filePath);
+        return recording;
+    }
+
     // ==================== 录像点播 ====================
 
     /**

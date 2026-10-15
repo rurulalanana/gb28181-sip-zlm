@@ -251,7 +251,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         return broadcastService;
     }
 
-    /** WebRTC 播放信令（嵌入式模式下浏览器出画面的唯一通路）。 */
+    /** WebRTC 播放信令（低延迟通路；ws-flv 由 ZLM 内置 HTTP 服务直接提供）。 */
     public WebRtcService webRtcService() {
         return webRtcService;
     }
