@@ -22,11 +22,19 @@ public class Recording {
     /** ZLM 流名。 */
     private final String stream;
 
-    /** 录像文件绝对路径。 */
-    private final String filePath;
+    /**
+     * 录像文件绝对路径。
+     *
+     * <p>开始录制时为 {@code null}：ZLM 自行决定文件名与日期子目录，
+     * 需等首个分片落盘、{@code on_mk_record_mp4} 回调到达后才能确定。
+     */
+    private volatile String filePath;
 
     /** 录像文件 URL（ZLM HTTP 服务直链，可直接下载/播放）。 */
-    private final String fileUrl;
+    private volatile String fileUrl;
+
+    /** 文件大小（字节）；未落盘为 0。 */
+    private volatile long fileSize;
 
     /** 录像开始时间（epoch ms）。 */
     private final long startTime;
@@ -53,6 +61,28 @@ public class Recording {
     public static final String RECORDING = "RECORDING";
     /** 已结束（文件可回放）。 */
     public static final String CLOSED = "CLOSED";
+
+    /**
+     * 绑定 ZLM 回调给出的真实录像文件。
+     *
+     * <p>只允许绑定一次：ZLM 超过 {@code max_second} 会自动分段，
+     * 后续分片不应覆盖首个分片作为本次录像的代表文件。
+     */
+    void bindFile(String path, String fileName, long size) {
+        if (this.filePath != null) {
+            return;
+        }
+        this.filePath = path;
+        this.fileSize = size;
+        this.fileUrl = "record/" + fileName;
+    }
+
+    /** 用磁盘上的实际文件大小刷新（录制结束后文件已定稿）。 */
+    void refreshSize(long size) {
+        if (size > 0) {
+            this.fileSize = size;
+        }
+    }
 
     void close(long end) {
         this.endTime = end <= 0 ? System.currentTimeMillis() : end;

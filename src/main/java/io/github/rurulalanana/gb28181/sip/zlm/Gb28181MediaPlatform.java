@@ -77,7 +77,9 @@ public class Gb28181MediaPlatform implements AutoCloseable {
 
         // 2. 会话管理 + 事件桥接
         sessionManager = new RtpSessionManager(mediaServer, props);
-        recordingService = new RecordingService(mediaServer, props);
+        // 录像服务需要会话管理器来把「通道编码」解析成 ZLM 实际 app/stream：
+        // 单端口收流下 ZLM 流名是 <设备编码>_<通道编码>，与业务坐标不同
+        recordingService = new RecordingService(mediaServer, props, sessionManager);
         recordingService.setAutoRecord(props.isAutoRecord());
         mediaServer.setStreamListener(new ZlmMediaServer.StreamListener() {
             @Override
@@ -92,6 +94,10 @@ public class Gb28181MediaPlatform implements AutoCloseable {
                 recordingService.onStreamOffline(app, stream);
             }
         });
+
+        // MP4 录制分片落盘：ZLM 决定文件名与日期子目录，只有它能给出真实路径与大小，
+        // 因此录像条目的 filePath/fileSize 必须由本回调回填（见 RecordingService#onRecordMp4）。
+        mediaServer.setRecordListener(recordingService);
 
         // 无人观看自动关流：ZLM 判定超时后回调，此处发 BYE 并释放会话。
         // 不让 ZLM 直接关流（forceClose 保持 false），因为还需通知 SIP 侧释放设备带宽。

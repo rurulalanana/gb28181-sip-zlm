@@ -87,6 +87,9 @@ public class ZlmMediaServer {
     /** 无人观看时是否由 ZLM 直接关流（否则交业务侧处理）。 */
     private volatile boolean forceCloseOnNoReader;
 
+    /** MP4 录制分片落盘监听者。 */
+    private volatile RecordListener recordListener;
+
     /**
      * 单端口模式的流名解析器：SSRC（十进制串）→ ZLM 流名。
      *
@@ -148,6 +151,19 @@ public class ZlmMediaServer {
         this.noReaderListener = listener;
     }
 
+    /**
+     * 注册 MP4 录制分片监听者。
+     *
+     * <p>ZLM 在每段 MP4 落盘后广播一次，携带<b>真实文件路径与大小</b>。
+     * 这是获取录制产物的唯一可靠途径：{@code mk_recorder_start} 的
+     * {@code customized_path} 只是<b>目录</b>，文件名与日期子目录由 ZLM
+     * 自行生成（{@code <dir>/<recordApp>/<app>/<stream>/<date>/<date>-<HH-MM-SS>-<idx>.mp4}），
+     * 调用方无法事先拼出。
+     */
+    public void setRecordListener(RecordListener listener) {
+        this.recordListener = listener;
+    }
+
     /** 无人观看时是否由 ZLM 直接关流。 */
     public void setForceCloseOnNoReader(boolean force) {
         this.forceCloseOnNoReader = force;
@@ -183,6 +199,22 @@ public class ZlmMediaServer {
          * @param schema 协议（rtp/ts/hls/fmp4/rtmp）
          */
         void onNoReader(String app, String stream, String schema);
+    }
+
+    /** MP4 录制分片落盘监听者。回调来自 ZLM 原生线程，实现需线程安全且不得阻塞。 */
+    public interface RecordListener {
+        /**
+         * 一段 MP4 录制分片已生成（临时文件已改名为正式文件）。
+         *
+         * @param app      源流应用名
+         * @param stream   源流名
+         * @param filePath 录像文件绝对路径（ZLM 生成，已定稿）
+         * @param fileName 文件名
+         * @param fileSize 文件大小（字节）
+         * @param timeLen  该分片时长（秒）
+         */
+        void onRecordMp4(String app, String stream, String filePath,
+                         String fileName, long fileSize, float timeLen);
     }
 
     // ==================== 生命周期 ====================
@@ -515,6 +547,15 @@ public class ZlmMediaServer {
         setOption(a, "general.streamNoneReaderDelayMS",
                 String.valueOf(props.getStreamNoneReaderDelayMs()));
 
+        // ---- [protocol] MP4 录制计为观看者 ----
+        // ZLM 默认 mp4_as_player=0：MP4 录制任务不计入观看者数
+        // （MultiMediaSourceMuxer::totalReaderCount 里 `_mp4 ? _option.mp4_as_player : 0`）。
+        // 于是「点播 + 开录 + 关掉播放器」这一常见流程下，观看者数归零，
+        // 超过 streamNoneReaderDelayMS 后 ZLM 触发 no_reader 回调销毁媒体源，
+        // 录像被中途截断（现象：文件写了几 MB 后不再增长，duration 正常但内容不全）。
+        // 置 1 后录制本身即视为观看者，录像可独立于播放器持续进行。
+        setOption(a, "protocol.mp4_as_player", "1");
+
         // ---- [rtc] WebRTC 对外通告 ----
         // ZLM 默认用本机网卡地址当 ICE 候选（host candidate），但服务器往往在 NAT 后
         // （本项目：网卡 172.16.0.148，对外 160.202.254.65），浏览器拿到内网候选
@@ -641,6 +682,26 @@ public class ZlmMediaServer {
         // ZLM 日志回调：mk_env_init2 已把日志输出指向回调（不用控制台），
         // 这里统一转发到 SLF4J，便于按级别过滤与屏蔽已知无害噪音。
         ev.on_mk_log = this::forwardZlmLog;
+
+        // MP4 录制分片完成：拿到 ZLM 生成的真实路径与大小。
+        // customized_path 只是目录，文件名/日期子目录由 ZLM 决定，
+        // 因此录制产物的元数据必须以本回调为准，不能靠调用方拼路径。
+        ev.on_mk_record_mp4 = record -> {
+            try {
+                String app = a.mk_record_info_get_app(record);
+                String stream = a.mk_record_info_get_stream(record);
+                String filePath = a.mk_record_info_get_file_path(record);
+                String fileName = a.mk_record_info_get_file_name(record);
+                long fileSize = a.mk_record_info_get_file_size(record);
+                float timeLen = a.mk_record_info_get_time_len(record);
+                RecordListener l = recordListener;
+                if (l != null) {
+                    l.onRecordMp4(app, stream, filePath, fileName, fileSize, timeLen);
+                }
+            } catch (Throwable t) {
+                log.warn("处理 on_mk_record_mp4 异常", t);
+            }
+        };
 
         return ev;
     }
