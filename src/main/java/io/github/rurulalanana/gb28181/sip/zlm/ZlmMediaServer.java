@@ -514,6 +514,23 @@ public class ZlmMediaServer {
         setOption(a, "general.maxStreamWaitMS", String.valueOf(props.getMaxStreamWaitMs()));
         setOption(a, "general.streamNoneReaderDelayMS",
                 String.valueOf(props.getStreamNoneReaderDelayMs()));
+
+        // ---- [rtc] WebRTC 对外通告 ----
+        // ZLM 默认用本机网卡地址当 ICE 候选（host candidate），但服务器往往在 NAT 后
+        // （本项目：网卡 172.16.0.148，对外 160.202.254.65），浏览器拿到内网候选
+        // 会连不上，表现为协商成功但视频一直 0x0、播放器报「连接中断」。
+        // rtc.externIP 让 ZLM 把对外 IP 也当候选下发。
+        //
+        // 必须与 media-ip 区分：media-ip 是写进 SDP 给设备推流用的地址，
+        // 两者通常相同（同一台机器），但若 WebRTC 走独立入口可单独覆盖。
+        // 必须在 mk_rtc_server_start 之前设置：候选地址在服务启动时确定。
+        String rtcExternIp = props.getRtcExternIp();
+        if (rtcExternIp == null || rtcExternIp.isBlank()) {
+            rtcExternIp = props.getMediaIp();
+        }
+        setOption(a, "rtc.externIP", rtcExternIp);
+        // 候选端口默认 8000，与实际监听的 rtc.port 不一致会让浏览器连错端口
+        setOption(a, "rtc.port", String.valueOf(props.getRtcPort()));
     }
 
     private MK_EVENTS buildEvents(ZLMApi a) {

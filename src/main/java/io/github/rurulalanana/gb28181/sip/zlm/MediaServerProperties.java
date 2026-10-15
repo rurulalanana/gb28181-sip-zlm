@@ -94,6 +94,19 @@ public class MediaServerProperties {
     private final int rtcPort = 8000;
 
     /**
+     * WebRTC 对外通告 IP（ZLM 配置项 {@code rtc.externIP}）。
+     *
+     * <p>ZLM 默认把本机网卡地址作为 ICE host candidate 下发。服务器在 NAT 后时
+     * （网卡是内网地址、对外是另一个公网 IP），浏览器拿到内网候选连不上，
+     * 表现为 <b>SDP 协商成功但画面始终 0x0</b>、播放器提示「连接中断」。
+     *
+     * <p>留空时回退 {@link #mediaIp}（同机部署时二者相同）。
+     * 仅在 WebRTC 走独立入口时才需要单独覆盖。
+     */
+    @Builder.Default
+    private final String rtcExternIp = null;
+
+    /**
      * ZLM 流应用名（播放 URL 路径第一段）。国标生态惯例为 {@code rtp}。
      * <p>注意：嵌入式模式下 ZLM 未注册 HTTP 播放路由，{@code app/stream} 主要用于
      * WebRTC、RTSP、RTMP 与录像索引。
