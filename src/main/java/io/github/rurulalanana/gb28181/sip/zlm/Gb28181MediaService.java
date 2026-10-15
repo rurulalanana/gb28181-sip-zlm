@@ -9,6 +9,7 @@ import io.github.rurulalanana.gb28181.sip.event.RegisterEvent;
 import io.github.rurulalanana.gb28181.sip.event.SdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.SipCallback;
 import io.github.rurulalanana.gb28181.sip.sdp.SdpMessage;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -277,7 +278,7 @@ public class Gb28181MediaService implements SipCallback {
      * @param channelId 通道编码；{@code null} 或与设备编码相同表示点播设备自身
      */
     public RtpSession play(String deviceId, String channelId) {
-        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.REALTIME, null);
         SdpMessage offer = buildAnswerSdp(session, false);
@@ -309,7 +310,7 @@ public class Gb28181MediaService implements SipCallback {
      * @param item      {@link #queryRecordInfo} 检索到的录像段
      */
     public RtpSession playback(String deviceId, String channelId, RecordItem item) {
-        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.PLAYBACK, item.getFilePath());
         SdpMessage offer = buildPlaybackSdp(session, item);
@@ -334,7 +335,7 @@ public class Gb28181MediaService implements SipCallback {
      * @param filePath  设备侧文件路径（来自 RecordInfo 的 FilePath）
      */
     public RtpSession download(String deviceId, String channelId, String filePath) {
-        String channel = (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.DOWNLOAD, filePath);
         SdpMessage offer = buildAnswerSdp(session, false);

@@ -232,6 +232,18 @@ public class MediaServerProperties {
     private final boolean autoRecord = false;
 
     /**
+     * 是否把 ZLM 日志经 {@code on_mk_log} 回调转发到 SLF4J（默认<b>关</b>）。
+     *
+     * <p>关闭时 ZLM 日志直写控制台，好处是进程能正常退出；开启后可按级别映射到
+     * SLF4J 并屏蔽已知无害噪音，但<b>嵌入 ZLM 的进程将无法正常退出</b>：
+     * ZLM 静态析构时会往回调通道写最后一条日志，而此时 JVM 已在退出中，
+     * 结果是死锁（{@code thread::join} 互等）或 SIGABRT（{@code recursive_mutex lock failed}）。
+     * 详见 {@code ZlmMediaServer#LOG_MASK_CALLBACK}。
+     */
+    @Builder.Default
+    private final boolean zlmLogToSlf4j = false;
+
+    /**
      * ZLM 的 MPEG-PS 负载类型（{@code rtp.ps_pt}）。0 = 用 ZLM 默认（96，国标）。
      * 若要用 ffmpeg 推裸 H264 测试流，可把 PS 改到 98 并把 H264 设为 96。
      */

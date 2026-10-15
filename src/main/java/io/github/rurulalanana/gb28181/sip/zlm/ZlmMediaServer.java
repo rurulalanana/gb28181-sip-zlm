@@ -6,6 +6,7 @@ import com.aizuda.zlm4j.structure.MK_MEDIA_SOURCE;
 import com.sun.jna.Callback;
 import com.sun.jna.CallbackThreadInitializer;
 import com.sun.jna.Native;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,11 +39,23 @@ public class ZlmMediaServer {
     /** ZLM 默认虚拟主机名（{@code general.enableVhost=0} 时所有源都归于此）。 */
     static final String DEFAULT_VHOST = "__defaultVhost__";
 
+    /** ZLM 日志输出掩模：直写控制台（C 侧 {@code LOG_CONSOLE = 1 << 0}）。默认值。 */
+    private static final int LOG_CONSOLE = 1 << 0;
+
     /**
-     * ZLM 日志输出掩模：走 {@code on_mk_log} 回调（对应 C 侧 {@code LOG_CALLBACK = 1 << 2}）。
+     * ZLM 日志输出掩模：走 {@code on_mk_log} 回调（C 侧 {@code LOG_CALLBACK = 1 << 2}）。
      *
-     * <p>刻意不用 {@code LOG_CONSOLE}：直写控制台的日志 Java 侧拦不住，
-     * 无法按级别映射到 SLF4J，也无法屏蔽已知无害的噪音（见 {@link #forwardZlmLog}）。
+     * <p><b>默认不用它</b>（见 {@link MediaServerProperties#isZlmLogToSlf4j()}）：这条通道
+     * 会让嵌入了 ZLM 的进程<b>无法正常退出</b>。原因是 ZLM 原生库的静态析构
+     * （{@code ~Logger} → {@code ~AsyncLogWriter} → {@code std::thread::join()}）会向
+     * 该通道写最后一条日志，而此时 JVM 已在退出途中，于是：
+     * <ul>
+     *   <li>日志线程卡在 JNA 回调的 JNI 里（{@code JavaThread::block_if_vm_exited}），
+     *       与退出线程互等 → 进程永不退出（{@code mvn test} 跑不完、优雅停机卡死）；</li>
+     *   <li>即便绕开死锁，事件广播也会打到已析构的 {@code NoticeCenter} 上，
+     *       抛 C++ 异常 {@code recursive_mutex lock failed} → SIGABRT（退出码 134）。</li>
+     * </ul>
+     * 打开它只是为了让 ZLM 日志按级别映射进 SLF4J，代价由调用方自行承担。
      */
     private static final int LOG_MASK_CALLBACK = 1 << 2;
 
@@ -61,6 +74,15 @@ public class ZlmMediaServer {
 
     /** JNA 单例。整个 JVM 只需加载一次；zlm4j jar 内已打包各平台原生库。 */
     private static volatile ZLMApi api;
+
+    /**
+     * 退出钩子是否已注册（进程级只需一次）。
+     *
+     * <p>钩子只做一件事：清空 ZLM 事件回调，理由见 {@link #stop()}。
+     * 有了它，调用方即使忘了 {@code stop()}，进程退出也不会卡在
+     * ZLM 静态析构的线程 join 上。
+     */
+    private static final AtomicBoolean SHUTDOWN_HOOK_INSTALLED = new AtomicBoolean(false);
 
     private final MediaServerProperties props;
     private final AtomicBoolean started = new AtomicBoolean(false);
@@ -228,15 +250,19 @@ public class ZlmMediaServer {
         // 负载类型需在 env 初始化前写入全局配置（国标默认 PS=96）
         applyPayloadTypes(a);
         applyProtocolOptions(a);
-        // 线程数=1, 日志级别=1(DEBUG), 日志走 on_mk_log 回调而非控制台；
-        // 不加载外部 ini（默认配置已适配 GB28181：ps_pt=96, rtp 超时 15s）。
-        a.mk_env_init2(1, 1, LOG_MASK_CALLBACK, null, 0, 0, null, 0, null, null);
+        // 线程数=1, 日志级别=1(DEBUG)；不加载外部 ini（默认配置已适配 GB28181：
+        // ps_pt=96, rtp 超时 15s）。
+        // 日志掩模：默认 LOG_CONSOLE（ZLM 直写控制台，进程可正常退出）；
+        // 只有显式开启 zlmLogToSlf4j 才走 on_mk_log 回调通道（后果见 LOG_MASK_CALLBACK 说明）。
+        int logMask = props.isZlmLogToSlf4j() ? LOG_MASK_CALLBACK : LOG_CONSOLE;
+        a.mk_env_init2(1, 1, logMask, null, 0, 0, null, 0, null, null);
 
         events = buildEvents(a);
         // 必须在 mk_events_listen 之前固定回调线程：JNA 仅在回调首次交给原生侧时
         // 读一次线程初始化器（CallbackReference#getFunctionPointer），之后再设不生效
         pinCallbackThreads(events);
         a.mk_events_listen(events);
+        installShutdownHook();
 
         // 注意：ZLM 的 http/rtmp/rtsp/rtc 服务传 0 表示"用配置默认端口"（80/1935/554/8000），
         // 而 80 需要 root 才能绑定；这里把 0 解释为"自动选择空闲端口"，避免默认端口不可用。
@@ -269,6 +295,33 @@ public class ZlmMediaServer {
                 singlePort > 0 ? ("single:" + singlePort) : "per-channel");
     }
 
+    /**
+     * 注册 JVM 退出钩子（幂等）：退出前清空 ZLM 事件回调，避免退出死锁。
+     *
+     * <p>只清回调、不碰服务，避免与调用方（Spring 的 destroyMethod 等）的停机顺序打架。
+     * 钩子里刻意容忍一切异常：退出阶段抛异常会让 JVM 退出码异常。
+     */
+    private static void installShutdownHook() {
+        if (!SHUTDOWN_HOOK_INSTALLED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    ZLMApi a = api;
+                    if (a != null) {
+                        // 必须用局部变量：退出时 api() 若触发静态初始化会再加载一次原生库
+                        a.mk_events_listen(null);
+                    }
+                } catch (Throwable ignore) {
+                    // 退出阶段不容错会污染退出码
+                }
+            }, "gb28181-zlm-shutdown"));
+        } catch (Throwable t) {
+            log.warn("注册 ZLM 退出钩子失败（不影响启动）", t);
+        }
+    }
+
     /** 停止所有服务。幂等。 */
     public synchronized void stop() {
         if (!started.compareAndSet(true, false)) {
@@ -276,6 +329,15 @@ public class ZlmMediaServer {
         }
         try {
             api().mk_stop_all_server();
+            // 清空 ZLM 的事件回调（传 null 会让 ZLM 把内部 s_events 整体清零）。
+            //
+            // 原因：进程退出时 ZLM 原生库的静态析构会销毁自己的对象并广播最后几条事件，
+            // 此时任何「原生 → JNI → Java」的回调都可能与退出线程互等
+            // （日志线程卡在 JavaThread::block_if_vm_exited，退出线程卡在
+            // AsyncLogWriter::~AsyncLogWriter 的 std::thread::join），
+            // 表现为 mvn test 跑不完、生产优雅停机卡死；绕开死锁还可能打到已析构的
+            // NoticeCenter 上并 SIGABRT。先清零回调，退出期就不会再进 JNI。
+            api().mk_events_listen(null);
             log.info("ZLMediaKit 已停止");
         } catch (Throwable t) {
             log.warn("停止 ZLMediaKit 异常", t);
@@ -566,7 +628,7 @@ public class ZlmMediaServer {
         // 两者通常相同（同一台机器），但若 WebRTC 走独立入口可单独覆盖。
         // 必须在 mk_rtc_server_start 之前设置：候选地址在服务启动时确定。
         String rtcExternIp = props.getRtcExternIp();
-        if (rtcExternIp == null || rtcExternIp.isBlank()) {
+        if (StringUtils.isBlank(rtcExternIp)) {
             rtcExternIp = props.getMediaIp();
         }
         setOption(a, "rtc.externIP", rtcExternIp);
@@ -599,7 +661,7 @@ public class ZlmMediaServer {
                         String ssrc = a.mk_media_info_get_stream(info);
                         java.util.function.Function<String, String> namer = singlePortStreamNamer;
                         String name = namer == null ? null : namer.apply(ssrc);
-                        if (name == null || name.isBlank()) {
+                        if (StringUtils.isBlank(name)) {
                             // 认不出 SSRC：放行但保留 ZLM 的默认流名（SSRC 十六进制），
                             // 至少能出画面，便于排查是哪个 SSRC 没登记
                             log.warn("单端口推流：SSRC 未匹配到会话，保留默认流名: ssrc={}", ssrc);
@@ -679,9 +741,12 @@ public class ZlmMediaServer {
             }
         };
 
-        // ZLM 日志回调：mk_env_init2 已把日志输出指向回调（不用控制台），
-        // 这里统一转发到 SLF4J，便于按级别过滤与屏蔽已知无害噪音。
-        ev.on_mk_log = this::forwardZlmLog;
+        // ZLM 日志回调：仅在开启 zlmLogToSlf4j 时注册（此时 mk_env_init2 的掩模里才有
+        // LOG_CALLBACK）。默认不注册——回调为空时 ZLM 的事件 lambda 会直接跳过，
+        // 不会进 JNI，进程退出因此是干净的。
+        if (props.isZlmLogToSlf4j()) {
+            ev.on_mk_log = this::forwardZlmLog;
+        }
 
         // MP4 录制分片完成：拿到 ZLM 生成的真实路径与大小。
         // customized_path 只是目录，文件名/日期子目录由 ZLM 决定，

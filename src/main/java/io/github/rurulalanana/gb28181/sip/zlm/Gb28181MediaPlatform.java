@@ -3,6 +3,7 @@ package io.github.rurulalanana.gb28181.sip.zlm;
 import io.github.rurulalanana.gb28181.sip.Gb28181SipClient;
 import io.github.rurulalanana.gb28181.sip.Gb28181SipServer;
 import io.github.rurulalanana.gb28181.sip.security.CredentialProvider;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -169,7 +170,7 @@ public class Gb28181MediaPlatform implements AutoCloseable {
             return props.getCredentialProvider();
         }
         String password = props.getSipPassword();
-        if (password != null && !password.isBlank()) {
+        if (!StringUtils.isBlank(password)) {
             log.info("SIP 注册鉴权：已启用（平台统一密码）");
             // 任何 username 都返回同一密码，即只校验密码本身
             return username -> password;

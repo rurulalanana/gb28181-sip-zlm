@@ -2,6 +2,7 @@ package io.github.rurulalanana.gb28181.sip.zlm;
 
 import lombok.Getter;
 import lombok.ToString;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 一路流的各协议播放地址。
@@ -64,7 +65,7 @@ public class PlayUrls {
      */
     public static PlayUrls of(String host, int httpPort, int rtmpPort, int rtspPort, int rtcPort,
                               String app, String stream) {
-        String path = (app == null || app.isBlank()) ? stream : app + "/" + stream;
+        String path = StringUtils.isBlank(app) ? stream : app + "/" + stream;
         String httpFlv = httpPort > 0
                 ? "http://" + host + ":" + httpPort + "/" + path + ".live.flv" : null;
         String wsFlv = httpPort > 0

@@ -4,6 +4,7 @@ import com.aizuda.zlm4j.callback.IMKRtpServerDetachCallBack;
 import com.aizuda.zlm4j.structure.MK_RTP_SERVER;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 一路 GB28181 收流会话。
@@ -136,9 +137,9 @@ public class RtpSession {
         this.deviceId = deviceId;
         // 设备编码缺失时退回通道编码：单设备场景下二者相同，
         // 至少保证 app 非空（ZLM 要求 app/stream 均非空）
-        String fallbackApp = (deviceId == null || deviceId.isBlank()) ? channelId : deviceId;
-        this.zlmApp = (zlmApp == null || zlmApp.isBlank()) ? fallbackApp : zlmApp;
-        this.zlmStream = (zlmStream == null || zlmStream.isBlank()) ? channelId : zlmStream;
+        String fallbackApp = StringUtils.isBlank(deviceId) ? channelId : deviceId;
+        this.zlmApp = StringUtils.isBlank(zlmApp) ? fallbackApp : zlmApp;
+        this.zlmStream = StringUtils.isBlank(zlmStream) ? channelId : zlmStream;
         this.ssrc = ssrc;
         this.deviceSsrc = deviceSsrc;
         this.tcpMode = tcpMode;
@@ -243,7 +244,7 @@ public class RtpSession {
 
     /** 设备编码归一（缺失时退回通道编码，保证非空）。 */
     private static String zlmAppOf(String deviceId, String channelId) {
-        return (deviceId == null || deviceId.isBlank()) ? channelId : deviceId;
+        return StringUtils.isBlank(deviceId) ? channelId : deviceId;
     }
 
     /**

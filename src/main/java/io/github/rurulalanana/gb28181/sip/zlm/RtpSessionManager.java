@@ -4,6 +4,7 @@ import com.aizuda.zlm4j.callback.IMKRtpServerDetachCallBack;
 import com.aizuda.zlm4j.core.ZLMApi;
 import com.aizuda.zlm4j.structure.MK_RTP_SERVER;
 import io.github.rurulalanana.gb28181.sip.constant.GbId;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -117,7 +118,7 @@ public class RtpSessionManager {
      * <p>二者都为空时返回 {@code null}（调用方应视为非法入参）。
      */
     static String zlmAppOf(String deviceId, String channelId) {
-        return (deviceId == null || deviceId.isBlank()) ? channelId : deviceId;
+        return StringUtils.isBlank(deviceId) ? channelId : deviceId;
     }
 
     /**
@@ -126,7 +127,7 @@ public class RtpSessionManager {
      * <p>二者都为空时返回 {@code null}（调用方应视为非法入参）。
      */
     static String channelOf(String deviceId, String channelId) {
-        return (channelId == null || channelId.isBlank()) ? deviceId : channelId;
+        return StringUtils.isBlank(channelId) ? deviceId : channelId;
     }
 
     /** 会话事件监听者（业务侧）。 */
@@ -436,7 +437,7 @@ public class RtpSessionManager {
      * @return 实际关闭的会话数
      */
     public int closeByChannel(String channelId) {
-        if (channelId == null || channelId.isBlank()) {
+        if (StringUtils.isBlank(channelId)) {
             return 0;
         }
         List<String> keys = new ArrayList<>();
@@ -509,7 +510,7 @@ public class RtpSessionManager {
      * 能拿到设备编码时请用 {@link #getByChannel(String, String)}。
      */
     public RtpSession getByChannel(String channelId) {
-        if (channelId == null || channelId.isBlank()) {
+        if (StringUtils.isBlank(channelId)) {
             return null;
         }
         // 先按「设备编码=通道编码」直连场景（app == stream）尝试，最常见且无歧义
@@ -576,7 +577,7 @@ public class RtpSessionManager {
      * 裸序号（{@code "0"}）而 app 是通道编码，才需要兼容两种布局。
      */
     private RtpSession findByStream(String app, String stream) {
-        if (app == null || stream == null || app.isBlank() || stream.isBlank()) {
+        if (StringUtils.isBlank(app) || StringUtils.isBlank(stream)) {
             return null;
         }
         RtpSession session = byZlmKey.get(app + "/" + stream);
@@ -612,7 +613,7 @@ public class RtpSessionManager {
             }
             return null;
         }
-        return (app == null || stream == null || app.isBlank() || stream.isBlank())
+        return (StringUtils.isBlank(app) || StringUtils.isBlank(stream))
                 ? null : app + "/" + stream;
     }
 

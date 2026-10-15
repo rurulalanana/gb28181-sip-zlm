@@ -34,8 +34,8 @@
 
   <scm>
     <url>https://github.com/rurulalanana/gb28181-sip-zlm</url>
-    <connection>scm:git:https://github.com/rurulalanana/gb28181-sip.git</connection>
-    <developerConnection>scm:git:https://github.com/rurulalanana/gb28181-sip.git</developerConnection>
+    <connection>scm:git:https://github.com/rurulalanana/gb28181-sip-zlm.git</connection>
+    <developerConnection>scm:git:https://github.com/rurulalanana/gb28181-sip-zlm.git</developerConnection>
     <tag>HEAD</tag>
   </scm>
 
@@ -47,6 +47,7 @@
     <sip.module.version>1.0.3</sip.module.version>
     <zlm4j.version>1.12.0</zlm4j.version>
     <slf4j.version>1.7.36</slf4j.version>
+    <commons.lang3.version>3.12.0</commons.lang3.version>
     <junit.version>4.13.2</junit.version>
   </properties>
 
@@ -69,6 +70,13 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
       <version>${slf4j.version}</version>
+    </dependency>
+
+    <!-- 字符串判空：本模块字节码目标 Java 8，不能用 String#isBlank（Java 11 才有） -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>${commons.lang3.version}</version>
     </dependency>
 
     <dependency>
@@ -101,6 +109,9 @@
         <configuration>
           <source>1.8</source>
           <target>1.8</target>
+          <!-- release 会按 JDK 8 的平台 API 校验：用了 Java 9+ API（如 String#isBlank）
+               直接编译失败，避免生成"声明 8、实际要 11+"的字节码 -->
+          <release>8</release>
           <encoding>UTF-8</encoding>
           <annotationProcessorPaths>
             <path>
