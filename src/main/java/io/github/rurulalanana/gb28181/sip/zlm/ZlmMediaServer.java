@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -509,6 +511,61 @@ public class ZlmMediaServer {
         String url = "rtc://" + DEFAULT_VHOST + "/" + app + "/" + stream;
         log.debug("WebRTC 协商地址: {}", url);
         return url;
+    }
+
+    /**
+     * 统计「正在被观看」的<b>流</b>数量，可按流名前缀过滤。
+     *
+     * <p>用于概览页的「播放」计数：录像点播走的是 MP4 解复用源
+     * （{@code mk_load_mp4_file}），<b>不产生 RtpSession</b>，
+     * 因此只遍历会话表永远统计不到它，必须问 ZLM 本身。
+     *
+     * <p><b>为什么用主动查询而不是 {@code on_mk_media_play} 回调</b>：
+     * 那个回调本质是<b>播放鉴权</b>钩子 —— 一旦注册，ZLM 会挂起播放等待
+     * embedder 调 {@code mk_auth_invoker_do} 放行，任何异常或遗漏都会让
+     * 整个平台放不出画面（zlm4j 注释里对此有明确警告）。
+     * 本平台不需要播放鉴权，为统计一个数字去承担「全平台播不了」的风险
+     * 不划算。主动查询是只读的，无此副作用。
+     *
+     * <p><b>为什么按 app/stream 去重</b>：ZLM 会为同一路流注册
+     * fmp4/rtmp/rtsp/ts/hls 多个协议源，每个源独立计读者数
+     * （实测一路直播 5 个源全部非 0）。不去重的话「播放」会把
+     * 一路流算成 5。以 {@code app/stream} 为键去重后才是
+     * 「正在播放几路」的直觉值。
+     *
+     * @param streamPrefix 流名前缀（如 {@code record_}）；{@code null} 或空串表示不限
+     * @return 有播放者的流数量；查询失败返回 0
+     */
+    public int playingSourceCount(String streamPrefix) {
+        Set<String> playing = ConcurrentHashMap.newKeySet();
+        try {
+            com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
+                if (source == null) {
+                    return;
+                }
+                try {
+                    String app = api().mk_media_source_get_app(source);
+                    String stream = api().mk_media_source_get_stream(source);
+                    // 先过滤流名再查读者数：遍历回调在原生侧执行，少一次 JNA 调用更省
+                    if (streamPrefix != null && !streamPrefix.isEmpty()
+                            && (stream == null || !stream.startsWith(streamPrefix))) {
+                        return;
+                    }
+                    if (api().mk_media_source_get_total_reader_count(source) > 0) {
+                        playing.add(app + "/" + stream);
+                    }
+                } catch (Throwable t) {
+                    // 单个源失败不影响其余源
+                    log.debug("统计媒体源失败: {}", t.toString());
+                }
+            };
+            pinCallbackThread(cb);
+            // 四个过滤参数依次是 schema / vhost / app / stream，空串表示不限
+            api().mk_media_source_for_each(null, cb, "", "", "", "");
+        } catch (Throwable t) {
+            log.debug("遍历媒体源失败: {}", t.toString());
+        }
+        return playing.size();
     }
 
     /**
