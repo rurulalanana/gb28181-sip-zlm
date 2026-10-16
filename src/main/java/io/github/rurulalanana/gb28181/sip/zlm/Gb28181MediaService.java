@@ -93,6 +93,13 @@ public class Gb28181MediaService implements SipCallback {
 
     public void attach(Gb28181SipServer sipServer) {
         this.sipServer = sipServer;
+        // 把「关闭会话前发 BYE」注册到会话管理器。
+        //
+        // 为什么必须在这里挂钩子：会话被顶替发生在 RtpSessionManager.open()
+        // 内部（重复点播先关旧会话），调用方完全无感知，于是从不发 BYE ——
+        // 设备继续推旧流，新 INVITE 又推一路，同一通道两路流并存、带宽翻倍。
+        // 由会话管理器在关闭前回调，才能覆盖所有关闭路径。
+        this.sessionManager.setTeardownHook(this::byeQuietly);
     }
 
     public void setCascadeForwarder(CascadeForwarder cascadeForwarder) {
@@ -281,15 +288,23 @@ public class Gb28181MediaService implements SipCallback {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.REALTIME, null);
-        SdpMessage offer = buildAnswerSdp(session, false);
-        // 标准 9.2：Request-URI / To / Subject 都要填「被点播的通道编码」，
-        // 不能填设备编码 —— 设备会在自己的通道列表里找这个编码，
-        // 找不到就静默丢弃（模拟器不校验，所以只有真实设备/下级平台会暴露）
-        String callId = client().invitePlay(deviceId, channel, offer);
-        sessionManager.bindCallId(session, callId);
-        log.info("已发起点播 INVITE: {} media={}:{} callId={}",
-                session, props.getMediaIp(), session.getPort(), callId);
-        return session;
+        try {
+            SdpMessage offer = buildAnswerSdp(session, false);
+            // 标准 9.2：Request-URI / To / Subject 都要填「被点播的通道编码」，
+            // 不能填设备编码 —— 设备会在自己的通道列表里找这个编码，
+            // 找不到就静默丢弃（模拟器不校验，所以只有真实设备/下级平台会暴露）
+            String callId = client().invitePlay(deviceId, channel, offer);
+            sessionManager.bindCallId(session, callId);
+            log.info("已发起点播 INVITE: {} media={}:{} callId={}",
+                    session, props.getMediaIp(), session.getPort(), callId);
+            return session;
+        } catch (RuntimeException e) {
+            // INVITE 没发出去/被拒 → 会话永远不可能 ONLINE。
+            // 必须回滚：留在索引里就是僵尸，后续按通道找会话会命中它，
+            // 带着错误的 app/stream 长期占位，云端录像再也找不到媒体源。
+            sessionManager.abort(session.getSessionKey());
+            throw e;
+        }
     }
 
     /**
@@ -313,13 +328,19 @@ public class Gb28181MediaService implements SipCallback {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.PLAYBACK, item.getFilePath());
-        SdpMessage offer = buildPlaybackSdp(session, item);
-        // 同实时点播：Request-URI / To / Subject 填通道编码
-        String callId = client().invitePlayback(deviceId, channel, offer);
-        sessionManager.bindCallId(session, callId);
-        log.info("已发起回放 INVITE: {} file={} callId={} playUrls={}",
-                session, item.getFilePath(), callId, mediaServer.playUrls(session));
-        return session;
+        try {
+            SdpMessage offer = buildPlaybackSdp(session, item);
+            // 同实时点播：Request-URI / To / Subject 填通道编码
+            String callId = client().invitePlayback(deviceId, channel, offer);
+            sessionManager.bindCallId(session, callId);
+            log.info("已发起回放 INVITE: {} file={} callId={} playUrls={}",
+                    session, item.getFilePath(), callId, mediaServer.playUrls(session));
+            return session;
+        } catch (RuntimeException e) {
+            // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
+            sessionManager.abort(session.getSessionKey());
+            throw e;
+        }
     }
 
     /** 平台主动历史回放（设备直连：设备编码即通道编码）。 */
@@ -338,14 +359,20 @@ public class Gb28181MediaService implements SipCallback {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.DOWNLOAD, filePath);
-        SdpMessage offer = buildAnswerSdp(session, false);
-        // Subject 传 null：由 sip 模块按标准生成
-        // <通道编码>:<SSRC>,<平台编码>:0（此处 SDP 的 y= 已由 buildAnswerSdp 填好）
-        String callId = client().invite(deviceId, channel, offer, null);
-        sessionManager.bindCallId(session, callId);
-        log.info("已发起下载 INVITE: {} file={} callId={}",
-                session, filePath, callId);
-        return session;
+        try {
+            SdpMessage offer = buildAnswerSdp(session, false);
+            // Subject 传 null：由 sip 模块按标准生成
+            // <通道编码>:<SSRC>,<平台编码>:0（此处 SDP 的 y= 已由 buildAnswerSdp 填好）
+            String callId = client().invite(deviceId, channel, offer, null);
+            sessionManager.bindCallId(session, callId);
+            log.info("已发起下载 INVITE: {} file={} callId={}",
+                    session, filePath, callId);
+            return session;
+        } catch (RuntimeException e) {
+            // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
+            sessionManager.abort(session.getSessionKey());
+            throw e;
+        }
     }
 
     /** 平台主动文件下载（设备直连：设备编码即通道编码）。 */
@@ -402,7 +429,9 @@ public class Gb28181MediaService implements SipCallback {
             log.debug("停止点播：未找到活跃会话: {}", sessionKey);
             return false;
         }
-        byeQuietly(session);
+        // 不在此处发 BYE：closeByKey 会通过 teardownHook 统一发送。
+        // 两处都发会让设备收到重复 BYE（同一 Call-ID），且第二次在 native
+        // 资源释放后发出，实测触发 JVM 崩溃（SIGABRT / core dumped）。
         sessionManager.closeByKey(sessionKey);
         return true;
     }
@@ -410,6 +439,31 @@ public class Gb28181MediaService implements SipCallback {
     /** 停止点播（设备直连：设备编码即通道编码）。 */
     public boolean stop(String deviceId) {
         return stop(deviceId, deviceId);
+    }
+
+    /**
+     * 停止指定类型的会话（回放/下载与直播是独立会话，需按类型定位）。
+     *
+     * <p>直播与回放不再共用会话键，因此 {@link #stop(String, String)} 只关直播；
+     * 停回放必须走本方法，否则会去关一个不存在的键（返回 false）或误关直播。
+     *
+     * @param type 会话类型；{@code null} 或 {@link MediaType#REALTIME} 等价于
+     *             {@link #stop(String, String)}
+     * @return 是否找到并关闭了会话
+     */
+    public boolean stop(String deviceId, String channelId, MediaType type) {
+        if (type == null || type == MediaType.REALTIME) {
+            return stop(deviceId, channelId);
+        }
+        String sessionKey = RtpSessionManager.sessionKey(deviceId, channelId, type);
+        RtpSession session = sessionManager.getByKey(sessionKey);
+        if (session == null || RtpSession.CLOSED.equals(session.getState())) {
+            log.debug("停止会话：未找到活跃会话: {}", sessionKey);
+            return false;
+        }
+        // 同 stop(device, channel)：BYE 由 closeByKey 统一发送
+        sessionManager.closeByKey(sessionKey);
+        return true;
     }
 
     /**
@@ -437,7 +491,13 @@ public class Gb28181MediaService implements SipCallback {
             return false;
         }
         log.info("无人观看超时，关闭会话: {}", session);
-        byeQuietly(session);
+        // 记冷却再关流：设备不认 BYE（实测 LiveGBS）会继续推流，
+        // 不记冷却就会被孤儿流巡检立刻认领回来，形成
+        // 「认领 → 无人观看关流 → 再认领」的循环，每 30 秒刷一轮。
+        // 与 StreamService#reapIdleStreams 的关闭路径保持一致。
+        // 按会话键记（不是 SSRC，见 RtpSessionManager#markReaped 的说明）。
+        sessionManager.markReaped(session.getSessionKey());
+        // BYE 由 closeByKey 统一发送（见 teardownHook）
         sessionManager.closeByKey(session.getSessionKey());
         return true;
     }

@@ -230,16 +230,23 @@ public class RtpSession {
     }
 
     /**
-     * 会话唯一键：{@code <设备编码>/<通道编码>}。
+     * 会话唯一键：{@code <设备编码>/<通道编码>}，历史流（回放/下载）再拼类型后缀。
      *
      * <p><b>这是业务侧坐标，不是 ZLM 的 {@code app/stream}</b>：单端口模式下
      * ZLM 的 app 固定为 {@code rtp}、stream 为 {@code <设备>_<通道>}，
      * 但本键恒定不变，数据库 {@code gb_stream.stream_key} 与接口返回都依赖它。
      *
      * <p>不可退化成裸通道编码：通道编码只在设备内唯一，跨设备会重复（见 {@link #zlmApp}）。
+     *
+     * <p><b>为什么历史流要加后缀</b>：直播与回放共用同一键时，两者在 ZLM 里
+     * 也共用同一 {@code app/stream}，而一个 {@code app/stream} 只能有一个媒体源 ——
+     * 「有人看直播时另一人点回放」会把正在观看的直播踢掉。加后缀后两者是
+     * 独立会话、独立媒体源，可并存。直播（{@code REALTIME}）后缀为空，
+     * 键保持原样，不影响既有调用与数据库记录。
      */
     public String getSessionKey() {
-        return zlmAppOf(deviceId, channelId) + "/" + channelId;
+        return zlmAppOf(deviceId, channelId) + "/" + channelId
+                + RtpSessionManager.typeSuffix(type);
     }
 
     /** 设备编码归一（缺失时退回通道编码，保证非空）。 */

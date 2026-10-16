@@ -12,7 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,9 +40,6 @@ public class ZlmMediaServer {
 
     /** ZLM 默认虚拟主机名（{@code general.enableVhost=0} 时所有源都归于此）。 */
     static final String DEFAULT_VHOST = "__defaultVhost__";
-
-    /** 录制器类型：MP4（ZLM C API 的 {@code RECORD_TYPE_MP4}）。 */
-    private static final int RECORDER_TYPE_MP4 = 1;
 
     /** ZLM 日志输出掩模：直写控制台（C 侧 {@code LOG_CONSOLE = 1 << 0}）。默认值。 */
     private static final int LOG_CONSOLE = 1 << 0;
@@ -126,6 +123,14 @@ public class ZlmMediaServer {
      */
     private volatile java.util.function.Function<String, String> singlePortStreamNamer;
 
+    /**
+     * 孤儿流认领器：SSRC（十六进制串）→ 可读流名；认不出返回 {@code null}。
+     *
+     * <p>仅在 {@link #singlePortStreamNamer} 解析失败时兜底调用。用于处理
+     * 「设备收 BYE 回 200 OK 却不停止推流」导致会话已拆、流仍在推的场景。
+     */
+    private volatile java.util.function.Function<String, String> orphanReclaimer;
+
     /** 单端口模式下 ZLM 实际监听的端口（0 = 未启用）。 */
     private volatile int singlePort;
 
@@ -204,6 +209,18 @@ public class ZlmMediaServer {
      */
     public void setSinglePortStreamNamer(java.util.function.Function<String, String> namer) {
         this.singlePortStreamNamer = namer;
+    }
+
+    /**
+     * 装配孤儿流认领器（SSRC 十六进制串 → 可读流名，认不出返回 {@code null}）。
+     *
+     * <p>用途：部分下级平台（实测 LiveGBS）收 BYE 回 200 OK 却不停止推流。
+     * 此时平台侧会话已拆、SSRC 映射已清，设备推来的包认不出归属，
+     * 只能退化成十六进制流名的孤儿流。装了这个认领器后，推流回调会在
+     * 流名解析失败时再试一次「按 SSRC 墓碑重建会话」，把流重新纳管。
+     */
+    public void setOrphanReclaimer(java.util.function.Function<String, String> reclaimer) {
+        this.orphanReclaimer = reclaimer;
     }
 
     /** 单端口模式下 ZLM 实际监听的端口；未启用返回 0。 */
@@ -465,31 +482,73 @@ public class ZlmMediaServer {
      * @param stream 流名；{@code null} 或空串表示不限
      * @return 实际关闭的媒体源数量
      */
+    /**
+     * 关闭匹配的 ZLM 媒体源。
+     *
+     * <p><b>每个流只关一个协议源</b>。同一个流在 ZLM 里注册了 5 个协议源
+     * （fmp4/rtmp/rtsp/ts/hls），它们共享同一个 {@code MultiMediaSourceMuxer}；
+     * 关掉其中一个会连带销毁整个 muxer 与其余源。此时若继续关闭剩下的源，
+     * 拿到的是<b>已销毁的悬垂句柄</b>，ZLM 内部抛 C++ 异常：
+     * <pre>
+     * terminate called after throwing an instance of 'std::runtime_error'
+     *   what():  mediakit::RtmpMediaSource::getOwnerPoller failed: rtmp://...
+     * Aborted (core dumped)
+     * </pre>
+     * 实测线上因这个原因崩溃 16 次（每次中断约 4 分钟），
+     * 触发时机正是「停止直播 / 会话被顶替」。
+     *
+     * <p><b>为什么还要分两阶段</b>：在 {@code mk_media_source_for_each} 的
+     * 回调里直接关源，等于边遍历 ZLM 注册表边改它。虽然 ZLM 会先做快照，
+     * 但关闭动作本身会触发内部事件与引用计数变更，仍然不安全。
+     * 先收集完句柄、遍历结束后再关，彻底避开这个窗口。
+     *
+     * @param app    应用名；{@code null} 或空串表示不限
+     * @param stream 流名；{@code null} 或空串表示不限
+     * @return 实际关闭的媒体源数量
+     */
     public int closeMediaSource(String app, String stream) {
         ZLMApi a = api();
-        AtomicInteger closed = new AtomicInteger();
+        // 阶段一：只读遍历，按 app/stream 去重收集（不修改任何状态）
+        java.util.Map<String, com.aizuda.zlm4j.structure.MK_MEDIA_SOURCE> targets =
+                new java.util.LinkedHashMap<>();
         try {
             com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
                 if (source == null) {
                     return;
                 }
                 try {
-                    String schema = a.mk_media_source_get_schema(source);
                     String srcApp = a.mk_media_source_get_app(source);
                     String srcStream = a.mk_media_source_get_stream(source);
-                    // force=1：有人观看也强制关闭，否则停播时播放器会把流钉住
-                    if (a.mk_media_source_close(source, 1) != 0) {
-                        closed.incrementAndGet();
-                        log.info("已关闭 ZLM 媒体源: {}://{}/{}", schema, srcApp, srcStream);
-                    }
+                    // 同一个流的多个协议源只保留一个：关一个即可连带销毁其余
+                    targets.putIfAbsent(srcApp + "/" + srcStream, source);
                 } catch (Throwable t) {
-                    log.warn("关闭 ZLM 媒体源异常: {}", t.getMessage());
+                    log.debug("收集媒体源失败: {}", t.toString());
                 }
             };
             pinCallbackThread(cb);
-            a.mk_media_source_for_each(null, cb, "", "", app == null ? "" : app, stream == null ? "" : stream);
+            a.mk_media_source_for_each(null, cb, "", "",
+                    app == null ? "" : app, stream == null ? "" : stream);
         } catch (Throwable t) {
             log.warn("遍历 ZLM 媒体源失败: app={} stream={}", app, stream, t);
+            return 0;
+        }
+        if (targets.isEmpty()) {
+            return 0;
+        }
+        // 阶段二：遍历已结束，每个流只关一次
+        AtomicInteger closed = new AtomicInteger();
+        for (java.util.Map.Entry<String, com.aizuda.zlm4j.structure.MK_MEDIA_SOURCE> e
+                : targets.entrySet()) {
+            try {
+                String schema = a.mk_media_source_get_schema(e.getValue());
+                // force=1：有人观看也强制关闭，否则停播时播放器会把流钉住
+                if (a.mk_media_source_close(e.getValue(), 1) != 0) {
+                    closed.incrementAndGet();
+                    log.info("已关闭 ZLM 媒体源: {}://{}", schema, e.getKey());
+                }
+            } catch (Throwable t) {
+                log.warn("关闭 ZLM 媒体源异常: {} {}", e.getKey(), t.getMessage());
+            }
         }
         return closed.get();
     }
@@ -517,7 +576,7 @@ public class ZlmMediaServer {
     }
 
     /**
-     * 统计「正在被观看」的<b>流</b>数量，可按流名前缀过滤。
+     * 统计「正在播放」的<b>观众总数</b>（含录制器），可按流名前缀过滤。
      *
      * <p>用于概览页的「播放」计数：录像点播走的是 MP4 解复用源
      * （{@code mk_load_mp4_file}），<b>不产生 RtpSession</b>，
@@ -530,23 +589,32 @@ public class ZlmMediaServer {
      * 本平台不需要播放鉴权，为统计一个数字去承担「全平台播不了」的风险
      * 不划算。主动查询是只读的，无此副作用。
      *
-     * <p><b>为什么按 app/stream 去重</b>：ZLM 会为同一路流注册
-     * fmp4/rtmp/rtsp/ts/hls 多个协议源，每个源独立计读者数
-     * （实测一路直播 5 个源全部非 0）。不去重的话「播放」会把
-     * 一路流算成 5。以 {@code app/stream} 为键去重后才是
-     * 「正在播放几路」的直觉值。
+     * <p><b>两个 reader API 的区别（实测数据）</b>：一路流会注册
+     * fmp4/rtmp/rtsp/ts/hls 多个协议源，而
+     * <ul>
+     *   <li>{@code mk_media_source_get_reader_count} 是<b>该协议自己的</b>
+     *       读者数 —— 只有实际被使用的那一个非零
+     *       （用 FLV 播放 2 路时只有 rtmp=2，其余全 0）；</li>
+     *   <li>{@code mk_media_source_get_total_reader_count} 是<b>整路流的</b>
+     *       总读者数 —— 5 个源返回<b>同一个值</b>（都用 FLV 播时全为 2）。</li>
+     * </ul>
+     * 因此必须按 {@code app/stream} 归并后取一个 total：
+     * 把 5 个源相加会重复 5 倍；只看「是否 &gt; 0」会把观众数压成 0/1，
+     * 表现为「开两个播放窗口只显示 1」。
      *
-     * <p><b>为什么要排除正在录制的源</b>：录制器本身会占用一个 reader 名额
-     * —— 实测「只开录像、无人观看」时 reader 数从 0 变 1，
-     * 于是概览页会在没任何观众的情况下显示「播放 1」。
-     * 但录制中的流确实需要保持在线（否则设备会被 BYE 掉），
-     * 故不能用 reader 数去判断「该不该关流」，只在本计数里剔除。
+     * <p><b>「播放」包含录制器</b>：ZLM 把 MP4 录制器也算作一个 reader
+     * （{@code protocol.mp4_as_player=1}，见 {@link #applyOptions}），
+     * 所以「只开录像、无人观看」的通道也会计为 1。这是刻意的：
+     * 录像本身就在消费这路流，平台按「有多少消费者」展示更符合运维直觉。
      *
      * @param streamPrefix 流名前缀（如 {@code record_}）；{@code null} 或空串表示不限
-     * @return 有播放者的流数量；查询失败返回 0
+     * @return 观众总数（含录制器）；查询失败返回 0
      */
     public int playingSourceCount(String streamPrefix) {
-        Set<String> playing = ConcurrentHashMap.newKeySet();
+        // app/stream -> 该路流的总读者数。
+        // 5 个协议源会写同一个键，取最大值（理论上相等；取 max 可避免
+        // 并发下恰好读到某个源瞬时的 0）
+        Map<String, Integer> byStream = new ConcurrentHashMap<>();
         try {
             com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
                 if (source == null) {
@@ -560,14 +628,11 @@ public class ZlmMediaServer {
                             && (stream == null || !stream.startsWith(streamPrefix))) {
                         return;
                     }
-                    if (api().mk_media_source_get_total_reader_count(source) <= 0) {
+                    int readers = api().mk_media_source_get_total_reader_count(source);
+                    if (readers <= 0) {
                         return;
                     }
-                    // 正在录制的源不计入：录制器自己占一个 reader，会凭空多出「播放 1」
-                    if (app != null && stream != null && isRecordingSource(app, stream)) {
-                        return;
-                    }
-                    playing.add(app + "/" + stream);
+                    byStream.merge(app + "/" + stream, readers, Math::max);
                 } catch (Throwable t) {
                     // 单个源失败不影响其余源
                     log.debug("统计媒体源失败: {}", t.toString());
@@ -579,25 +644,143 @@ public class ZlmMediaServer {
         } catch (Throwable t) {
             log.debug("遍历媒体源失败: {}", t.toString());
         }
-        return playing.size();
+        int total = 0;
+        for (Integer n : byStream.values()) {
+            total += n;
+        }
+        return total;
     }
 
     /**
-     * 该 {@code app/stream} 是否正在被 ZLM 录制（MP4）。
+     * ZLM 的无人观看判定时长（毫秒，{@code general.streamNoneReaderDelayMS}）。
      *
-     * <p>用于把「录制器」从观看者统计里剔除。录制器的 reader 名额是 ZLM 内部
-     * 实现细节（它把 muxer 也当成一个消费者），不代表真的有人在看。
+     * <p>供平台侧做空闲流巡检时对齐宽限期：刚建立的会话读者数天然是 0
+     * （还没人来得及播放），若立刻按「无观众」关闭就会把刚点播的流误杀。
+     * 用与 ZLM 回调相同的阈值，语义一致。
      *
-     * @return 正在录制返回 true；查询失败返回 false（宁可多计也不漏计）
+     * @return 判定时长（毫秒）
      */
-    private boolean isRecordingSource(String app, String stream) {
+    public int noneReaderDelayMs() {
+        return props.getStreamNoneReaderDelayMs();
+    }
+
+    /**
+     * 某路流当前的观众总数（含录制器）。
+     *
+     * <p><b>为什么需要主动查询</b>：ZLM 的 {@code on_mk_media_no_reader} 回调
+     * <b>每个媒体源只触发一次</b>（内部 {@code _none_reader} 标志位），
+     * 且只在「读者数由非零降为零」的那次检查中触发。因此
+     * <ul>
+     *   <li>平台重启后，设备仍在推流但平台无会话 —— 回调可能在会话重建
+     *       <b>之前</b>就已触发过，之后永不重来（实测差 2 秒）；
+     *   <li>重新纳管（认领孤儿流）时流早已注册，回调不会补发。</li>
+     * </ul>
+     * 于是这些流「既不会被无人观看关掉，也永远不会再触发回调」。
+     * 靠回调无法覆盖，必须能主动问「这路流现在还有观众吗」。
+     *
+     * <p>按 {@code app/stream} 归并取 {@code total_reader_count} 的最大值：
+     * 一路流会注册 fmp4/rtmp/rtsp/ts/hls 多个协议源，各自返回同一个总数
+     * （见 {@link #playingSourceCount(String)} 的实测说明），
+     * 相加会重复计数，取 max 才是这路流的真实观众数。
+     *
+     * <p>不传 {@code streamPrefix}：这里要查具体某一路，按完整 app/stream 匹配。
+     *
+     * @param app    ZLM 应用名
+     * @param stream ZLM 流名
+     * @return 观众总数（含录制器）；流不存在或查询失败返回 {@code 0}
+     */
+    public int readerCount(String app, String stream) {
+        if (StringUtils.isBlank(app) || StringUtils.isBlank(stream)) {
+            return 0;
+        }
+        java.util.concurrent.atomic.AtomicInteger max = new java.util.concurrent.atomic.AtomicInteger();
         try {
-            return api().mk_recorder_is_recording(RECORDER_TYPE_MP4,
-                    props.getVhost(), app, stream) == 1;
+            com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
+                if (source == null) {
+                    return;
+                }
+                try {
+                    // 先比对 app/stream 再查读者数：遍历回调在原生侧执行，
+                    // 少一次 JNA 调用更省
+                    if (!app.equals(api().mk_media_source_get_app(source))
+                            || !stream.equals(api().mk_media_source_get_stream(source))) {
+                        return;
+                    }
+                    int n = api().mk_media_source_get_total_reader_count(source);
+                    max.accumulateAndGet(n, Math::max);
+                } catch (Throwable t) {
+                    log.debug("查询媒体源读者数失败: {}", t.toString());
+                }
+            };
+            pinCallbackThread(cb);
+            api().mk_media_source_for_each(null, cb, "", "", "", "");
         } catch (Throwable t) {
-            log.debug("查询录制状态失败: {}/{}", app, stream, t);
+            log.debug("遍历媒体源失败: {}", t.toString());
+        }
+        return max.get();
+    }
+
+    /**
+     * 列出所有「流名仍是 SSRC 十六进制串」的媒体源（= 未被平台纳管的孤儿流）。
+     *
+     * <p><b>为什么靠流名判定</b>：单端口模式下，被正常纳管的流其流名会被推流回调
+     * 通过 {@code stream_replace} 改成 {@code <设备编码>_<通道编码>}；
+     * 而认不出 SSRC 归属时回调只能放行并保留 ZLM 默认名（SSRC 的大写十六进制）。
+     * 所以「流名是 8 位十六进制」就等价于「这路流没被纳管」。
+     *
+     * <p>典型成因：设备（下级平台）不理会 BYE 持续推流，而平台重启后
+     * SSRC 索引为空、或恢复映射的时机晚于设备推流（{@code publish} 回调
+     * 只在流首次注册时触发一次，错过就永久错过）。
+     *
+     * @return 孤儿流的 ZLM 流名（SSRC 十六进制串）列表
+     */
+    public List<String> orphanStreamNames() {
+        java.util.Set<String> names = new java.util.LinkedHashSet<>();
+        try {
+            com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
+                if (source == null) {
+                    return;
+                }
+                try {
+                    String stream = api().mk_media_source_get_stream(source);
+                    if (isSsrcHexName(stream)) {
+                        names.add(stream);
+                    }
+                } catch (Throwable t) {
+                    log.debug("枚举孤儿流失败: {}", t.toString());
+                }
+            };
+            pinCallbackThread(cb);
+            api().mk_media_source_for_each(null, cb, "", "", "", "");
+        } catch (Throwable t) {
+            log.debug("遍历媒体源失败: {}", t.toString());
+        }
+        return new java.util.ArrayList<>(names);
+    }
+
+    /**
+     * 流名是否为「SSRC 十六进制串」（= 未被平台纳管的孤儿流）。
+     *
+     * <p>判据：长度 1..8 且全为十六进制字符，同时<b>不是</b>平台命名
+     * （平台命名形如 {@code <设备编码>_<通道编码>}，含下划线；或纯 20 位数字编码）。
+     * 纯数字串（如 {@code 200000001}）也算 SSRC 名 —— ZLM 的
+     * {@code printSSRC} 输出大写十六进制，前导零被去掉后可能只剩数字。
+     */
+    static boolean isSsrcHexName(String stream) {
+        if (stream == null || stream.isEmpty() || stream.length() > 8) {
             return false;
         }
+        if (stream.indexOf('_') >= 0) {
+            return false; // 平台命名 <设备>_<通道>
+        }
+        for (int i = 0; i < stream.length(); i++) {
+            char c = stream.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -751,7 +934,16 @@ public class ZlmMediaServer {
                         java.util.function.Function<String, String> namer = singlePortStreamNamer;
                         String name = namer == null ? null : namer.apply(ssrc);
                         if (StringUtils.isBlank(name)) {
-                            // 认不出 SSRC：放行但保留 ZLM 的默认流名（SSRC 十六进制），
+                            // 认不出 SSRC：可能是「设备不认 BYE、会话已拆但仍在推流」
+                            // 的孤儿流。先尝试按墓碑重新认领（重建会话 → 恢复可见），
+                            // 认领成功就按可读流名放行，不再退化成十六进制名。
+                            java.util.function.Function<String, String> reclaimer = orphanReclaimer;
+                            if (reclaimer != null) {
+                                name = reclaimer.apply(ssrc);
+                            }
+                        }
+                        if (StringUtils.isBlank(name)) {
+                            // 仍认不出：放行但保留 ZLM 的默认流名（SSRC 十六进制），
                             // 至少能出画面，便于排查是哪个 SSRC 没登记
                             log.warn("单端口推流：SSRC 未匹配到会话，保留默认流名: ssrc={}", ssrc);
                             a.mk_publish_auth_invoker_do(invoker, null, 0, 0);
