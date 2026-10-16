@@ -506,7 +506,32 @@ public class RtpSessionManager {
         }
     }
 
-    /** 按会话键关闭（{@code <设备编码>/<通道编码>}）。 */
+    /**
+     * 停机前：只为所有活跃会话补发一次 BYE，<b>不做</b>本地资源收尾。
+     *
+     * <p><b>为什么需要单独一趟</b>：{@link #closeAll()} 每关一个会话都要
+     * 注销 ZLM 媒体源、等待 native detach —— 慢。停机流程有超时，超时会被
+     * 强杀，于是只有前面少数几个会话来得及发 BYE，其余对话在设备/下级平台侧
+     * 永久残留（实测 LiveGBS 会一直推，每一路约 3 Mbps，直到人工清理）。
+     * 先把所有 BYE 快速发完，再做慢的收尾，才能保证「一个都不漏」。
+     *
+     * @return 实际通知的会话数
+     */
+    public int notifyAllTeardown() {
+        int n = 0;
+        for (RtpSession s : new ArrayList<>(byChannel.values())) {
+            if (s == null || RtpSession.CLOSED.equals(s.getState())) {
+                continue;
+            }
+            notifyTeardown(s);
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * 按会话键关闭（{@code <设备编码>/<通道编码>}）。
+     */
     public void closeByKey(String sessionKey) {
         // 用条件删除：仅当映射仍指向本会话时才摘除。
         // 直接 remove 会把「键上已换成新会话」的场景一起清掉，
@@ -665,6 +690,17 @@ public class RtpSessionManager {
     private final Map<Long, Long> ssrcTombstoneAt = new ConcurrentHashMap<>();
 
     /**
+     * SSRC → 该流所属对话的 Call-ID。
+     *
+     * <p><b>为什么必须一起记</b>：设备/下级平台只认 BYE，而发 BYE 必须带 Call-ID。
+     * 会话被拆后 SSRC 仍被沿用，平台再认领（见 {@link #reclaimOrphanBySsrc}）时
+     * 若不带回 Call-ID，这个新会话就永远关不掉 —— 空闲巡检发现无观看者后
+     * 只能本地注销媒体源，设备侧继续推（实测 LiveGBS 每路约 3 Mbps、从不超时），
+     * 表现为「脏流走了关流流程但一直还在推」。
+     */
+    private final Map<Long, String> ssrcCallId = new ConcurrentHashMap<>();
+
+    /**
      * 空闲关流的冷却时间：这段时间内不再自动重新认领同一通道。
      *
      * <p><b>为什么需要</b>：设备不认 BYE 时会形成
@@ -727,6 +763,12 @@ public class RtpSessionManager {
         purgeExpiredTombstones();
         ssrcTombstone.put(ssrc, session.getSessionKey());
         ssrcTombstoneAt.put(ssrc, System.currentTimeMillis());
+        // Call-ID 一并记住：认领出的会话要靠它发 BYE（见 ssrcCallId 注释）。
+        // 会话创建时 Call-ID 可能还没回填（INVITE 后才拿到），此时不覆盖已有值。
+        String callId = session.getCallId();
+        if (StringUtils.isNotBlank(callId)) {
+            ssrcCallId.put(ssrc, callId);
+        }
     }
 
     /**
@@ -747,12 +789,28 @@ public class RtpSessionManager {
      * @return 是否成功登记（入参非法时返回 false）
      */
     public boolean restoreSsrcMapping(String ssrc, String sessionKey) {
+        return restoreSsrcMapping(ssrc, sessionKey, null);
+    }
+
+    /**
+     * 同 {@link #restoreSsrcMapping(String, String)}，并额外恢复该流的 Call-ID。
+     *
+     * <p>带上 Call-ID 后，重启后认领出的孤儿流才能被正常关闭：空闲巡检关流时会
+     * 发 BYE 通知设备停推（见 {@link #ssrcCallId}）。不带就只能本地注销媒体源，
+     * 设备会一直推下去。
+     *
+     * @param callId 上一轮该对话的 Call-ID；可为空
+     */
+    public boolean restoreSsrcMapping(String ssrc, String sessionKey, String callId) {
         Long key = parseSsrc(ssrc);
         if (key == null || StringUtils.isBlank(sessionKey)) {
             return false;
         }
         ssrcTombstone.put(key, sessionKey);
         ssrcTombstoneAt.put(key, System.currentTimeMillis());
+        if (StringUtils.isNotBlank(callId)) {
+            ssrcCallId.put(key, callId);
+        }
         restoredSsrc.add(key);
         return true;
     }
@@ -770,6 +828,7 @@ public class RtpSessionManager {
             Long at = ssrcTombstoneAt.get(e.getKey());
             if (at == null || now - at > SSRC_TOMBSTONE_TTL_MS) {
                 ssrcTombstoneAt.remove(e.getKey());
+                ssrcCallId.remove(e.getKey());
                 return true;
             }
             return false;
@@ -801,6 +860,57 @@ public class RtpSessionManager {
      * @return 重新认领的会话；无法认领或被拒返回 {@code null}
      */
     public RtpSession reclaimOrphanBySsrc(String ssrcHex) {
+        return reclaimOrphanBySsrc(ssrcHex, false);
+    }
+
+    /**
+     * 认领「该通道已经在推」的孤儿流（按墓碑反查 SSRC，再看 ZLM 里是否真有这个源）。
+     *
+     * <p><b>用于用户主动点播</b>：没有活会话时，若设备侧其实还在推上一轮的流
+     * （下级平台收不到 BYE 时会一直推），直接再发 INVITE 会让设备为同一通道
+     * 开<b>第二路</b>推流 —— 实测 LiveGBS 真的会推第二路（每路约 3 Mbps），
+     * 同一通道点几次就攒几路，表现为「级联那边显示还有 N 个视频正在推送」。
+     * 先把已在推的那路认领回来，既避免重复推流，也省掉一次 INVITE 的握手时延。
+     *
+     * <p>与自动巡检不同，<b>这里忽略空闲关流冷却</b>：冷却是为了避免自动巡检
+     * 反复认领造成抖动；用户明确要看，就应该立刻给他已有的那路流。
+     *
+     * @param deviceId  设备编码
+     * @param channelId 通道编码
+     * @return 认领到的会话；没有匹配的孤儿流时返回 {@code null}
+     */
+    public RtpSession reclaimOrphanForChannel(String deviceId, String channelId) {
+        String key = sessionKey(deviceId, channelId);
+        if (StringUtils.isBlank(key) || mediaServer == null) {
+            return null;
+        }
+        List<String> orphans;
+        try {
+            orphans = mediaServer.orphanStreamNames();
+        } catch (Throwable t) {
+            log.debug("枚举孤儿流失败: {}", t.toString());
+            return null;
+        }
+        for (String name : orphans) {
+            Long ssrc = hexSsrcToValue(name);
+            if (ssrc == null || !key.equals(ssrcTombstone.get(ssrc))) {
+                continue;
+            }
+            RtpSession adopted = reclaimOrphanBySsrc(name, true);
+            if (adopted != null) {
+                log.info("点播前认领到该通道已在推的流，不再重复发 INVITE: {} ssrc={}", key, name);
+                return adopted;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 认领孤儿流。
+     *
+     * @param ignoreCooldown {@code true} 表示用户主动请求，忽略空闲关流冷却
+     */
+    private RtpSession reclaimOrphanBySsrc(String ssrcHex, boolean ignoreCooldown) {
         Long ssrc = hexSsrcToValue(ssrcHex);
         if (ssrc == null) {
             return null;
@@ -819,7 +929,8 @@ public class RtpSessionManager {
         // 「认领 → 关流 → 认领」的无限循环（见 REAP_COOLDOWN_MS）。
         // 按会话键判定，不能按 SSRC —— 会话的 ssrc 是 SDP 通告值，
         // 与设备实际推流用的 RTP SSRC 往往不同（见 markReaped 注释）。
-        if (recentlyReaped(key)) {
+        // 用户主动点播时（ignoreCooldown）不适用：他明确要看，就该立刻给。
+        if (!ignoreCooldown && recentlyReaped(key)) {
             log.debug("放弃认领孤儿流（刚因空闲被关流，冷却中）: ssrc={} 通道={}", ssrcHex, key);
             return null;
         }
@@ -842,8 +953,9 @@ public class RtpSessionManager {
         // zlmStream 用 ssrcHex（ZLM 里的真实流名），见方法注释 —— 用可读名会导致
         // 无人观看关不掉、录像找不到媒体源。
         // ssrc 传十进制串（与 SDP y= 同口径）：落库的 gb_stream.ssrc 要能反查回数值。
+        // callId 从墓碑取回：没有它这个会话就永远发不出 BYE（设备会一直推）。
         RtpSession session = new RtpSession(channel, device, String.valueOf(ssrc), null,
-                0, null, null,
+                0, ssrcCallId.get(ssrc), null,
                 mediaServer.getSinglePort(), type, null,
                 SINGLE_PORT_APP, ssrcHex);
         session.setState(RtpSession.ONLINE);
@@ -1063,6 +1175,13 @@ public class RtpSessionManager {
         if (callId != null && session != null) {
             session.setCallId(callId);
             byCallId.put(callId, session);
+            // 同步到墓碑：registerSsrc 在 open() 里跑，那时还没拿到 Call-ID，
+            // 不在此补一次的话墓碑里永远是 null，重启后认领出的会话就发不出 BYE
+            // （设备会一直推，实测 LiveGBS 每路约 3 Mbps）。
+            Long ssrc = parseSsrc(session.getSsrc());
+            if (ssrc != null) {
+                ssrcCallId.put(ssrc, callId);
+            }
         }
     }
 

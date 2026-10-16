@@ -503,6 +503,39 @@ public class Gb28181MediaService implements SipCallback {
     }
 
     /**
+     * 为「上一轮运行遗留的对话」补发 BYE，释放远端仍在进行的推流。
+     *
+     * <p><b>为什么必须补</b>：进程被强杀（{@code gb.sh} 优雅停止超时会强制 kill）
+     * 时来不及发 BYE，设备/下级平台不知道我方已退出，会<b>一直推下去</b>。
+     * 实测 LiveGBS 每一路约 3 Mbps 且永不超时，重启几次就攒成多路重复推流，
+     * 表现为「级联那边显示还有 N 个视频正在推送」。平台侧已经没有对话信息，
+     * 只能靠库里持久化的 Call-ID 在启动时补发一次。
+     *
+     * <p><b>为什么不需要原对话的 tag</b>：实测 LiveGBS 按 Call-ID 匹配，只带
+     * Call-ID 的 BYE 它照样回 200 OK 并停止推流。对严格实现该对话已不存在的
+     * 设备，会回 481（无害）；已结束的对话再发 BYE 也不会造成副作用。
+     *
+     * @param deviceId  设备编码（BYE 的发送目标）
+     * @param channelId 通道编码；为空时退回设备编码
+     * @param callId    上一轮该对话的 Call-ID
+     * @return 是否已发出（不代表对端一定停止）
+     */
+    public boolean byeQuietly(String deviceId, String channelId, String callId) {
+        if (StringUtils.isBlank(deviceId) || StringUtils.isBlank(callId) || sipServer == null) {
+            return false;
+        }
+        String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
+        try {
+            // toTag 传 null：上一轮的 tag 没有持久化，且 LiveGBS 按 Call-ID 匹配即可
+            client().bye(deviceId, channel, callId, null);
+            return true;
+        } catch (Throwable t) {
+            log.debug("补发 BYE 失败: device={} callId={} {}", deviceId, callId, t.toString());
+            return false;
+        }
+    }
+
+    /**
      * 尽力发送 BYE 释放设备带宽；失败只告警，不阻断本地资源释放。
      *
      * <p>三种情况会跳过：会话无 Call-ID（平台侧尚未回填）、无设备编码、

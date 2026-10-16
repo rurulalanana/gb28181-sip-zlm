@@ -184,6 +184,24 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         if (mediaServer == null) {
             return;
         }
+        // 【顺序至关重要】先把 BYE 全部发出去，再停 SIP 服务。
+        //
+        // 原顺序（先 sipServer.stop() 再 sessionManager.closeAll()）下 BYE 一个都
+        // 发不出去 —— SIP 栈已经关了。而设备/下级平台只认 BYE：收不到就会一直
+        // 推流（实测 LiveGBS 每路约 3 Mbps、永不超时），重启几次就攒出多路重复推流，
+        // 只能人工清理。即使 order 正确，也必须单独先走一趟：closeAll() 每关一个
+        // 会话都要做 native 收尾，很慢，停机超时被强杀时只来得及发前几个。
+        try {
+            RtpSessionManager manager = sessionManager;
+            if (manager != null) {
+                int n = manager.notifyAllTeardown();
+                if (n > 0) {
+                    log.info("停机：已通知 {} 个会话停止推流（BYE）", n);
+                }
+            }
+        } catch (Throwable t) {
+            log.warn("停机补发 BYE 异常（继续收尾）", t);
+        }
         try {
             if (sipServer != null) {
                 sipServer.stop();
