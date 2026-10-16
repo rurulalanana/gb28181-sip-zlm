@@ -41,6 +41,9 @@ public class ZlmMediaServer {
     /** ZLM 默认虚拟主机名（{@code general.enableVhost=0} 时所有源都归于此）。 */
     static final String DEFAULT_VHOST = "__defaultVhost__";
 
+    /** 录制器类型：MP4（ZLM C API 的 {@code RECORD_TYPE_MP4}）。 */
+    private static final int RECORDER_TYPE_MP4 = 1;
+
     /** ZLM 日志输出掩模：直写控制台（C 侧 {@code LOG_CONSOLE = 1 << 0}）。默认值。 */
     private static final int LOG_CONSOLE = 1 << 0;
 
@@ -533,6 +536,12 @@ public class ZlmMediaServer {
      * 一路流算成 5。以 {@code app/stream} 为键去重后才是
      * 「正在播放几路」的直觉值。
      *
+     * <p><b>为什么要排除正在录制的源</b>：录制器本身会占用一个 reader 名额
+     * —— 实测「只开录像、无人观看」时 reader 数从 0 变 1，
+     * 于是概览页会在没任何观众的情况下显示「播放 1」。
+     * 但录制中的流确实需要保持在线（否则设备会被 BYE 掉），
+     * 故不能用 reader 数去判断「该不该关流」，只在本计数里剔除。
+     *
      * @param streamPrefix 流名前缀（如 {@code record_}）；{@code null} 或空串表示不限
      * @return 有播放者的流数量；查询失败返回 0
      */
@@ -551,9 +560,14 @@ public class ZlmMediaServer {
                             && (stream == null || !stream.startsWith(streamPrefix))) {
                         return;
                     }
-                    if (api().mk_media_source_get_total_reader_count(source) > 0) {
-                        playing.add(app + "/" + stream);
+                    if (api().mk_media_source_get_total_reader_count(source) <= 0) {
+                        return;
                     }
+                    // 正在录制的源不计入：录制器自己占一个 reader，会凭空多出「播放 1」
+                    if (app != null && stream != null && isRecordingSource(app, stream)) {
+                        return;
+                    }
+                    playing.add(app + "/" + stream);
                 } catch (Throwable t) {
                     // 单个源失败不影响其余源
                     log.debug("统计媒体源失败: {}", t.toString());
@@ -566,6 +580,24 @@ public class ZlmMediaServer {
             log.debug("遍历媒体源失败: {}", t.toString());
         }
         return playing.size();
+    }
+
+    /**
+     * 该 {@code app/stream} 是否正在被 ZLM 录制（MP4）。
+     *
+     * <p>用于把「录制器」从观看者统计里剔除。录制器的 reader 名额是 ZLM 内部
+     * 实现细节（它把 muxer 也当成一个消费者），不代表真的有人在看。
+     *
+     * @return 正在录制返回 true；查询失败返回 false（宁可多计也不漏计）
+     */
+    private boolean isRecordingSource(String app, String stream) {
+        try {
+            return api().mk_recorder_is_recording(RECORDER_TYPE_MP4,
+                    props.getVhost(), app, stream) == 1;
+        } catch (Throwable t) {
+            log.debug("查询录制状态失败: {}/{}", app, stream, t);
+            return false;
+        }
     }
 
     /**
