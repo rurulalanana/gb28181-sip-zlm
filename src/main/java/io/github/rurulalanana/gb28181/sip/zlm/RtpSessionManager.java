@@ -338,6 +338,20 @@ public class RtpSessionManager {
      */
     public RtpSession open(String channelId, String deviceId, String deviceSsrc, int tcpMode,
                            String callId, MediaType type, String mediaUri) {
+        return open(channelId, deviceId, deviceSsrc, tcpMode, callId, type, mediaUri, -1);
+    }
+
+    /**
+     * 为通道打开收流会话（实时 / 回放 / 下载共用收流机制）。
+     *
+     * @param type     会话类型，决定 SDP 的 {@code s=} 与 SSRC 历史位
+     * @param mediaUri 回放/下载的媒体标识（SDP {@code u=}）
+     * @param streamNumber 码流编号（GB/T 28181—2022 附录 G：SSRC 后 4 位）。
+     *                     {@code -1} 表示自动 —— 用域内自增序号（2016 行为）；
+     *                     {@code 0} 主码流、{@code 1} 子码流
+     */
+    public RtpSession open(String channelId, String deviceId, String deviceSsrc, int tcpMode,
+                           String callId, MediaType type, String mediaUri, int streamNumber) {
         // 归一缺失值（设备直连场景 deviceId == channelId），否则键会拼出 "null" 段
         final String channel = channelOf(deviceId, channelId);
         final String device = zlmAppOf(deviceId, channelId);
@@ -369,7 +383,10 @@ public class RtpSessionManager {
 
         ZLMApi api = ZlmMediaServer.api();
         // SSRC 首位：实时 0 / 历史 1（GB/T 28181 附录 G）；buildSsrc 第三个参数是 realtime
-        String ssrc = GbId.buildSsrc(channel, ssrcSeq.getAndIncrement(), !mediaType.historical());
+        // 后 4 位：自动模式用域内自增序号；指定码流编号时用该编号
+        //（GB/T 28181—2022：后 4 位即码流编号，0 主码流 / 1 子码流）
+        int streamSeq = streamNumber >= 0 ? streamNumber : ssrcSeq.getAndIncrement();
+        String ssrc = GbId.buildSsrc(channel, streamSeq, !mediaType.historical());
         String ssrcFilter = normalizeSsrc(deviceSsrc);
 
         boolean singlePort = mediaServer.isSinglePortMode();

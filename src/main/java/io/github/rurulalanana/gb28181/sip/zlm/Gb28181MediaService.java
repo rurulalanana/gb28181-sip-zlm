@@ -285,9 +285,21 @@ public class Gb28181MediaService implements SipCallback {
      * @param channelId 通道编码；{@code null} 或与设备编码相同表示点播设备自身
      */
     public RtpSession play(String deviceId, String channelId) {
+        return play(deviceId, channelId, -1);
+    }
+
+    /**
+     * 平台主动实时点播（标准 9.2），可指定码流编号。
+     *
+     * @param deviceId  设备编码（SIP 目标，必须全局唯一）
+     * @param channelId 通道编码；{@code null} 或与设备编码相同表示点播设备自身
+     * @param streamNumber 码流编号（GB/T 28181—2022 附录 G：SSRC 后 4 位）。
+     *                     {@code -1} 自动（域内自增序号）；{@code 0} 主码流、{@code 1} 子码流
+     */
+    public RtpSession play(String deviceId, String channelId, int streamNumber) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
-                MediaType.REALTIME, null);
+                MediaType.REALTIME, null, streamNumber);
         try {
             SdpMessage offer = buildAnswerSdp(session, false);
             // 标准 9.2：Request-URI / To / Subject 都要填「被点播的通道编码」，
