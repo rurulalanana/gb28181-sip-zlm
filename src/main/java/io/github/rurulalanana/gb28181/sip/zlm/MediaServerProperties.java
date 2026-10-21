@@ -173,6 +173,20 @@ public class MediaServerProperties {
     @Builder.Default
     private final boolean enableRtmp = true;
 
+    /**
+     * {@code [rtmp] enhanced}：FLV 视频标签是否使用增强型 RTMP（E-RTMP）头。
+     *
+     * <p><b>默认为 false（传统 FLV）</b>。开启后 H.265 的 FLV 标签会带 8 字节
+     * 增强头（{@code enhanced=1} + FourCC {@code hvc1}），这是 E-RTMP 规范，
+     * 但绝大多数 JS 播放器（含 {@code xgplayer-transmuxer}）只认传统 FLV 的
+     * {@code codecId=12}，遇到增强头会直接丢弃整个视频轨（表现为「只有声音没有画面」）。
+     *
+     * <p>关闭后 H.265 走传统扩展格式（{@code codecId=12} + AVCC 风格的 hvcC），
+     * 兼容性最好。H.264 不受影响（两种格式都是传统头）。
+     */
+    @Builder.Default
+    private final boolean rtmpEnhanced = false;
+
     /** {@code [protocol] enable_rtsp}：RTSP/WebRTC。 */
     @Builder.Default
     private final boolean enableRtsp = true;

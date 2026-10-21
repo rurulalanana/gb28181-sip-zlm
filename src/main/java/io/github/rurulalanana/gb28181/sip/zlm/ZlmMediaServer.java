@@ -863,6 +863,11 @@ public class ZlmMediaServer {
         setOption(a, "protocol.ts_demand", "0");
         setOption(a, "protocol.fmp4_demand", "0");
 
+        // ---- [rtmp] FLV 视频标签格式 ----
+        // 关闭增强型 RTMP 头，让 H.265 走传统 FLV 的 codecId=12。
+        // 详见 MediaServerProperties.rtmpEnhanced 的说明。
+        setOption(a, "rtmp.enhanced", props.isRtmpEnhanced() ? "1" : "0");
+
         // ---- [hls] 切片 ----
         setOption(a, "hls.hls_save_path", props.getHlsSavePath());
         setOption(a, "hls.segDur", String.valueOf(props.getHlsSegDur()));
