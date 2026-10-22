@@ -151,6 +151,27 @@ public class MediaServerProperties {
     @Builder.Default
     private final int rtpSinglePortNumber = 24560;
 
+    /**
+     * 平台主动点播时向设备协商的媒体传输方式。
+     *
+     * <p><b>默认 {@code true}（TCP 被动）</b>。原因：
+     * UDP 收流在公网/跨网段下会丢包，而<b>H.265 高码率流对丢包极其敏感</b> ——
+     * 实测 2560x1440 / 约 3 Mbps 的 H.265 通道，一个关键帧近 100KB
+     * （约 65 个 RTP 包），丢一个包整帧就解不出来。ZLM 仍会把残缺帧写进 MP4，
+     * 结果就是录像文件里出现
+     * {@code Invalid NAL unit 0} / {@code Could not find ref with POC N} /
+     * {@code VPS 0 does not exist}，浏览器（以及任何不容错的解码器）直接解码失败。
+     *
+     * <p>同一台设备上的 H.264 通道（1280x720 / 约 0.8 Mbps）则完全正常，
+     * 因为码率低四倍、单帧包数少，丢包概率小得多 —— 这也印证了丢包是主因。
+     *
+     * <p>改用 TCP 被动（ZLM 监听、设备主动连）后 RTP 可靠传输，码流完整。
+     * 若设备不支持 TCP 被动（INVITE 被拒或超时），会自动回退到 UDP，
+     * 不会让点播直接失败。
+     */
+    @Builder.Default
+    private final boolean tcpMedia = true;
+
     /** ZLM 虚拟主机名（默认虚拟主机）。 */
     @Builder.Default
     private final String vhost = "__defaultVhost__";
