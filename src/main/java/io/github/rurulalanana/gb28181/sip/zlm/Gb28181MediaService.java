@@ -297,42 +297,18 @@ public class Gb28181MediaService implements SipCallback {
      *                     {@code -1} 自动（域内自增序号）；{@code 0} 主码流、{@code 1} 子码流
      */
     public RtpSession play(String deviceId, String channelId, int streamNumber) {
-        /*
-         * 优先 TCP 被动收流（见 MediaServerProperties#tcpMedia 的说明）：
-         * UDP 丢包会让 H.265 高码率流的录像变成坏码流，浏览器解不了。
-         *
-         * 部分设备不支持 TCP 被动（回 488/超时/不建联），此时自动回退 UDP，
-         * 保证点播本身不失败。
-         */
-        if (props.isTcpMedia()) {
-            try {
-                return doPlay(deviceId, channelId, streamNumber, true);
-            } catch (RuntimeException e) {
-                log.warn("TCP 被动收流点播失败，回退 UDP：{} {}", channelId, e.toString());
-            }
-        }
-        return doPlay(deviceId, channelId, streamNumber, false);
-    }
-
-    /**
-     * 发起点播 INVITE。
-     *
-     * @param tcp {@code true} 用 TCP 被动收流，{@code false} 用 UDP
-     */
-    private RtpSession doPlay(String deviceId, String channelId, int streamNumber, boolean tcp) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
-        RtpSession session = sessionManager.open(channel, deviceId, null,
-                tcp ? RtpSessionManager.TCP_MODE_PASSIVE : 0, null,
+        RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.REALTIME, null, streamNumber);
         try {
-            SdpMessage offer = buildAnswerSdp(session, tcp);
+            SdpMessage offer = buildAnswerSdp(session, false);
             // 标准 9.2：Request-URI / To / Subject 都要填「被点播的通道编码」，
             // 不能填设备编码 —— 设备会在自己的通道列表里找这个编码，
             // 找不到就静默丢弃（模拟器不校验，所以只有真实设备/下级平台会暴露）
             String callId = client().invitePlay(deviceId, channel, offer);
             sessionManager.bindCallId(session, callId);
-            log.info("已发起点播 INVITE: {} media={}:{} transport={} callId={}",
-                    session, props.getMediaIp(), session.getPort(), tcp ? "TCP" : "UDP", callId);
+            log.info("已发起点播 INVITE: {} media={}:{} callId={}",
+                    session, props.getMediaIp(), session.getPort(), callId);
             return session;
         } catch (RuntimeException e) {
             // INVITE 没发出去/被拒 → 会话永远不可能 ONLINE。
