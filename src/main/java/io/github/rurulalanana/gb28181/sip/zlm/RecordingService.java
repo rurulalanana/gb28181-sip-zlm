@@ -270,6 +270,12 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
         // 此时流可能已下线、会话已摘除，重新解析会拿到不同的值而停不掉
         String app = recording != null ? recording.getApp() : props.getApp();
         String stream = recording != null ? recording.getStream() : channelId;
+        // 停录前清掉「上一段」的绑定：等 ZLM 把正在写的文件关闭后，
+        // 回调会带上最后这一个分片的路径。不清空的话下面的等待循环看到
+        // filePath 已非空就立刻返回，归档下来的会是上一次的分片。
+        if (recording != null) {
+            recording.awaitFinalSegment();
+        }
         ZLMApi api = ZlmMediaServer.api();
         api.mk_recorder_stop(RECORDER_TYPE_MP4, props.getVhost(), app, stream);
 
@@ -293,12 +299,18 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
         // 回调已到达（或超时）：此时再摘除索引，避免与回调竞争
         activeBySource.remove(sourceKey(app, stream));
 
-        if (recording.getFilePath() == null && finalizeTimeoutMs > 0) {
-            log.warn("停止录像但未产生文件（录制期间未收到媒体帧？）: channel={} source={}/{}",
-                    channelId, app, stream);
+        // 【必须按 filePath 分支，不能按「是否等待」分支】
+        // 原写法是 `filePath == null && finalizeTimeoutMs > 0`，
+        // 于是 finalizeTimeoutMs == 0（流事件/停机路径）且 filePath 仍为空时
+        // 会落到 else 分支，`new File(null)` 直接 NPE —— 而这段代码跑在
+        // ZLM 的 event poller 线程上，异常逃逸到原生侧是未定义行为。
+        String finalPath = recording.getFilePath();
+        if (finalPath == null || finalPath.trim().isEmpty()) {
+            log.warn("停止录像但未拿到文件路径（录制期间未收到媒体帧？交由磁盘对账补登记）: "
+                    + "channel={} source={}/{}", channelId, app, stream);
         } else {
             // 停止后文件已定稿：用磁盘实际大小刷新（回调报的是分段落盘时的大小）
-            File f = new File(recording.getFilePath());
+            File f = new File(finalPath);
             if (f.exists()) {
                 recording.refreshSize(f.length());
             }
@@ -306,17 +318,22 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
         recording.close(System.currentTimeMillis());
         log.info("停止录像: channel={} source={}/{} 时长={}s file={} size={}B",
                 channelId, app, stream, recording.durationSeconds(),
-                recording.getFilePath(), recording.getFileSize());
+                finalPath, recording.getFileSize());
         return recording;
     }
 
     /**
-     * MP4 分片落盘回调：把 ZLM 生成的真实路径与大小回填到录像条目。
+     * MP4 分片落盘回调：把 ZLM 生成的真实路径、大小、时长回填到录像条目。
      *
-     * <p>ZLM 按 {@code max_second} 自动分段，一段录像可能产生多个文件。
-     * 本平台对外只暴露「一次录制 = 一个文件」的语义，因此只在首段落盘时
-     * 绑定路径（即用户点开始到停止这段时长通常不超过 {@code recordMaxSecond}）。
-     * 若确因超长而分段，后续分片会以独立文件留在同目录，可从磁盘目录取回。
+     * <p>ZLM 按 {@code max_second} 持续分段（当前 1800 秒一片），
+     * 每写完一片就回调一次。本条目<b>每次都重新指向最新完成的那一片</b>
+     * （见 {@link Recording#bindSegment}）：
+     * <ul>
+     *   <li>只绑首段会让条目退化成「幽灵记录」——时长一路涨、
+     *       文件却停在 30 分钟（实测显示 5791 秒 / 170MB）；</li>
+     *   <li>已完成的历史分片由库里各自独立成条（归档/对账负责），
+     *       本条目只代表「当前会话最后落盘的那一段」。</li>
+     * </ul>
      */
     @Override
     public void onRecordMp4(String app, String stream, String filePath,
@@ -327,14 +344,49 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
                     app, stream, filePath);
             return;
         }
-        if (recording.getFilePath() == null) {
-            recording.bindFile(filePath, fileName, fileSize);
+        // 分片的开始时间从文件名解析（ZLM 以「开始时刻」命名：yyyy-MM-dd-HH-mm-ss-<idx>.mp4）。
+        // 比「上一段结束 + timeLen」累加更准：后者会累积时钟误差。
+        long segStart = parseSegmentStartMillis(fileName);
+        boolean rotated = recording.getFilePath() != null;
+        // 每次落盘都重绑：本条目代表「最近完成的一个分片」，
+        // 否则「录制中」会变成跨越所有分片的幽灵记录（详见 Recording#bindSegment）
+        recording.bindSegment(filePath, fileName, fileSize, segStart, timeLen);
+        if (!rotated) {
             log.info("录像分片已落盘: channel={} file={} size={}B 时长={}s",
                     recording.getChannelId(), filePath, fileSize, timeLen);
         } else {
-            // 已绑定首段：后续分片只记录，不覆盖主路径
-            log.info("录像分段落盘（附加分片）: channel={} file={} size={}B",
-                    recording.getChannelId(), filePath, fileSize);
+            log.info("录像分片轮转: channel={} file={} size={}B 时长={}s（会话继续，本条已指向新分片）",
+                    recording.getChannelId(), filePath, fileSize, timeLen);
+        }
+    }
+
+    /**
+     * 从 ZLM 分片文件名解析开始时刻（epoch ms）。
+     *
+     * <p>文件名格式见 ZLM {@code Mp4.cpp}：{@code yyyy-MM-dd-HH-mm-ss-<idx>.mp4}
+     * （如 {@code 2026-10-23-11-54-48-0.mp4}，最后一段是分段序号）。
+     *
+     * <p>解析失败返回 0，调用方（{@link Recording#bindSegment}）会保留原有的
+     * startTime，不至于把时间改坏。
+     */
+    private static long parseSegmentStartMillis(String fileName) {
+        if (fileName == null) {
+            return 0L;
+        }
+        // 去掉 .mp4 后缀，按 '-' 拆；前 6 段是日期时间，第 7 段是序号
+        String base = fileName.toLowerCase().endsWith(".mp4")
+                ? fileName.substring(0, fileName.length() - 4) : fileName;
+        String[] p = base.split("-");
+        if (p.length < 6) {
+            return 0L;
+        }
+        try {
+            java.time.LocalDateTime t = java.time.LocalDateTime.of(
+                    Integer.parseInt(p[0]), Integer.parseInt(p[1]), Integer.parseInt(p[2]),
+                    Integer.parseInt(p[3]), Integer.parseInt(p[4]), Integer.parseInt(p[5]));
+            return t.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+        } catch (Exception e) {
+            return 0L;
         }
     }
 
