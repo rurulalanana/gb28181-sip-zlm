@@ -44,6 +44,23 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
     /** 等待最后分片落盘的轮询间隔（毫秒）。 */
     private static final long FINALIZE_POLL_MS = 100;
 
+    /**
+     * 停机时每路录像的收尾等待上限（毫秒）。
+     *
+     * <p><b>为什么比 {@link #FINALIZE_TIMEOUT_MS} 短得多</b>：停机时
+     * SIP 已经先停了，设备随即停止推流，ZLM 会<b>抢先自动停录</b>并把文件落盘 ——
+     * 等我们再调 {@code mk_recorder_stop} 时，recorder 早就没了，
+     * {@code on_mk_record_mp4} 回调永远不会来。
+     *
+     * <p>实测停机时等满 10 秒仍然 {@code file=null size=0B}（文件其实已在磁盘上、
+     * 大小正确、可正常播放）。这 10 秒纯粹是白等，而它直接拖慢每次重启。
+     *
+     * <p>现在只等 3 秒：正常情况（流还活着）够 ZLM 收尾；
+     * 拿不到路径也没关系 —— 归档已改为「索引条目没有 filePath 就按磁盘文件补登记」
+     * （见 {@code RecordService#archiveRecording}），下次启动的对账也会兜底。
+     */
+    private static final long SHUTDOWN_FINALIZE_MS = 3_000;
+
     private final ZlmMediaServer mediaServer;
     private final MediaServerProperties props;
     private final RtpSessionManager sessionManager;
@@ -119,6 +136,31 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
     /** 是否随流上下线自动开关录像。 */
     private boolean autoRecord;
 
+    /**
+     * 运行时覆盖的单片时长（秒）；{@code <=0} 表示用 {@code props} 里的值。
+     *
+     * <p>用于支持「界面上改分片时长立即生效」。它<b>不影响正在录制的分片</b>：
+     * ZLM 在 {@code mk_recorder_start} 时就把 max_second 定下了，
+     * 因此必须在下一次开始录像时才读取本值。
+     */
+    private volatile int recordMaxSecondOverride;
+
+    /**
+     * 设置单片刻录时长（秒，{@code <=0} 表示恢复用配置值）。
+     *
+     * <p>线程安全：{@code volatile} 写，读取发生在
+     * {@link #startRecording} 里，不要求与写入原子。
+     */
+    public void setRecordMaxSecond(int seconds) {
+        this.recordMaxSecondOverride = seconds;
+    }
+
+    /** 当前生效的单片时长（秒）：运行时覆盖优先。 */
+    private int recordMaxSecond() {
+        int override = recordMaxSecondOverride;
+        return override > 0 ? override : props.getRecordMaxSecond();
+    }
+
     public void setAutoRecord(boolean autoRecord) {
         this.autoRecord = autoRecord;
     }
@@ -162,8 +204,9 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
         // 正确做法：只给目录，文件名与子目录交给 ZLM，产物路径由
         // on_mk_record_mp4 回调回填（见 {@link #onRecordMp4}）。
         ZLMApi api = ZlmMediaServer.api();
+        int maxSecond = recordMaxSecond();
         int code = api.mk_recorder_start(RECORDER_TYPE_MP4, props.getVhost(), app,
-                stream, dir.getAbsolutePath(), props.getRecordMaxSecond());
+                stream, dir.getAbsolutePath(), maxSecond);
         // zlm4j 的 mk_recorder_start 返回「1=成功，0=失败」（与多数 C API 相反）。
         // 曾按 0=成功 判断，导致真录制成功时被当成失败抛异常、而媒体源不存在
         // 时反而被当成成功。
@@ -192,6 +235,32 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
      * （表现为 filePath=null、fileSize=0、点播与下载全失败）。
      */
     public Recording stopRecording(String channelId) {
+        return stopRecording(channelId, FINALIZE_TIMEOUT_MS);
+    }
+
+    /** 停止录制，可选择是否等待最后一段落盘（{@code false} = 立即返回）。 */
+    public Recording stopRecording(String channelId, boolean waitFinalize) {
+        return stopRecording(channelId, waitFinalize ? FINALIZE_TIMEOUT_MS : 0L);
+    }
+
+    /**
+     * 停止录制，显式指定等待最后一段落盘的上限（毫秒）。
+     *
+     * <p>{@code 0} 表示完全不等待。见 {@link #SHUTDOWN_FINALIZE_MS} 的说明：
+     * 停机场景用 3 秒而不是 10 秒。
+     *
+     * <p><b>为什么需要这个开关</b>：{@link #onStreamOffline} 由 ZLM 的流下线事件
+     * 驱动，跑在 {@code zlm-event-worker} 单线程执行器上。若在那里等满
+     * {@link #FINALIZE_TIMEOUT_MS}（10 秒），同一条队列上其它通道的上下线事件
+     * 会被一起拖住 —— 4 路设备同时掉线就是 40 秒的状态停滞，
+     * 期间保活/归档都做不了。
+     *
+     * <p>不等也不会丢数据：ZLM 的 {@code on_mk_record_mp4} 回调（跑在它自己的
+     * poller 线程上，不会被本方法阻塞）随后会把真实路径回填到同一条
+     * {@link Recording} 上；即使这次没回填成功，磁盘上的正式文件也会被
+     * {@code RecordService#reconcileAutoRecordings} 周期性补登记。
+     */
+    public Recording stopRecording(String channelId, long finalizeTimeoutMs) {
         String recordId = activeByChannel.remove(channelId);
         if (recordId == null) {
             return null;
@@ -210,19 +279,21 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
         }
 
         // 等回调把最后一段的文件路径回填上来（录制过短、从未收到帧时不会回调，走超时）
-        long deadline = System.currentTimeMillis() + FINALIZE_TIMEOUT_MS;
-        while (recording.getFilePath() == null && System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(FINALIZE_POLL_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+        if (finalizeTimeoutMs > 0) {
+            long deadline = System.currentTimeMillis() + finalizeTimeoutMs;
+            while (recording.getFilePath() == null && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(FINALIZE_POLL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
         // 回调已到达（或超时）：此时再摘除索引，避免与回调竞争
         activeBySource.remove(sourceKey(app, stream));
 
-        if (recording.getFilePath() == null) {
+        if (recording.getFilePath() == null && finalizeTimeoutMs > 0) {
             log.warn("停止录像但未产生文件（录制期间未收到媒体帧？）: channel={} source={}/{}",
                     channelId, app, stream);
         } else {
@@ -468,8 +539,47 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
             channelId = findRecordingChannelByStream(app, stream);
         }
         if (channelId != null && isRecording(channelId)) {
-            stopRecording(channelId);
+            // 不等最后一段落盘：本方法跑在 zlm-event-worker 单线程队列上，
+            // 等满 10 秒会把其它通道的上下线事件一起堵住。
+            // 真实路径由 on_mk_record_mp4 回填，兜底交给录像对账。
+            stopRecording(channelId, false);
         }
+    }
+
+    /**
+     * 停止所有正在进行的录制，返回实际停掉的通道数。
+     *
+     * <p><b>专供停机收尾</b>：{@link ZlmMediaServer#stop()} 里的
+     * {@code mk_stop_all_server()} 会直接销毁媒体源，MP4 recorder 的异步收尾
+     * （flush 缓冲 → 写 moov → 临时名改正式名）来不及做完，
+     * 磁盘上就留下一个 {@code .} 前缀、<b>没有 moov</b> 的文件 ——
+     * 大小正常但任何播放器都打不开（实测丢过 55 分钟 / 319 MB）。
+     *
+     * <p>因此必须在停媒体服务<b>之前</b>逐个 {@link #stopRecording}：
+     * 此时流还活着，ZLM 能正常收尾，文件可播。
+     *
+     * <p>单个通道失败不影响其余通道：停机阶段一个异常不该让剩下的录像
+     * 全都丢掉。
+     *
+     * @return 成功停止并完成落盘的通道数
+     */
+    public int stopAll() {
+        List<String> channels = new ArrayList<>(activeByChannel.keySet());
+        if (channels.isEmpty()) {
+            return 0;
+        }
+        int n = 0;
+        for (String channelId : channels) {
+            try {
+                // 用停机专用的短等待：见 SHUTDOWN_FINALIZE_MS 的说明
+                if (stopRecording(channelId, SHUTDOWN_FINALIZE_MS) != null) {
+                    n++;
+                }
+            } catch (Throwable t) {
+                log.warn("停机停止录像失败（继续停其余通道）: channel={} {}", channelId, t.getMessage());
+            }
+        }
+        return n;
     }
 
     /** 兜底：按录像条目里记录的 app/stream 反查正在录制的通道。 */

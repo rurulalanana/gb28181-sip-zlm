@@ -209,6 +209,26 @@ public class Gb28181MediaPlatform implements AutoCloseable {
         } catch (Throwable t) {
             log.warn("停止 SIP 服务异常", t);
         }
+        // 【顺序至关重要】停录像必须排在 closeAll() 之前。
+        //
+        // closeAll() 内部走 release() → closeMediaSource()，会把 ZLM 媒体源注销；
+        // 源一旦消失，recorder 就没法再正常收尾（mk_recorder_stop 找不到源），
+        // 磁盘上留下 . 前缀、没有 moov 的文件 —— 大小正常但任何播放器都打不开
+        // （实测因此丢过 55 分钟 / 319 MB）。
+        //
+        // 放在这里时 SIP 已停（设备侧不会再推新数据），但媒体源仍在，
+        // recorder 能完整走完 flush → 写 moov → 改正式名。
+        try {
+            RecordingService rs = recordingService;
+            if (rs != null) {
+                int n = rs.stopAll();
+                if (n > 0) {
+                    log.info("停机：已停止 {} 路录像并完成落盘", n);
+                }
+            }
+        } catch (Throwable t) {
+            log.warn("停机停止录像异常（继续收尾）", t);
+        }
         try {
             sessionManager.closeAll();
         } catch (Throwable t) {

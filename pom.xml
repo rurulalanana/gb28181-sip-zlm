@@ -45,7 +45,22 @@
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
     <sip.module.version>1.0.3</sip.module.version>
-    <zlm4j.version>1.12.0</zlm4j.version>
+    <!--
+      1.13.0 而非 1.12.0：内嵌的 ZLM 内核从 ac64e33(2026-07-24) 换到
+      1026839(2026-09-22)，差两个月。
+
+      升级原因是一个致命崩溃：流异常断开（设备拔线 / SSRC 变化）时
+      ZLM 在析构 MultiMediaSourceMuxer 的过程中抛
+      mediakit::MediaSourceEvent::NotImplemented
+      （RtmpMediaSourceMuxer::getOwnerPoller not implemented）。
+      C++ 析构函数默认 noexcept，异常逃逸即 std::terminate() →
+      SIGABRT，整个 JVM 被 abort（实测 29 次 core dumped）。
+      这是原生库的 bug，Java 侧无法捕获或兜住。
+
+      升级后若仍复现，说明该路径未修，需回退到第 2/3 层防御
+      （缩短分片 + 崩溃后清理孤儿文件，见 record-max-second 配置）。
+    -->
+    <zlm4j.version>1.13.0</zlm4j.version>
     <slf4j.version>1.7.36</slf4j.version>
     <commons.lang3.version>3.12.0</commons.lang3.version>
     <junit.version>4.13.2</junit.version>

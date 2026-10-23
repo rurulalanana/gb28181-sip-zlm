@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -110,6 +111,37 @@ public class ZlmMediaServer {
 
     /** 无人观看时是否由 ZLM 直接关流（否则交业务侧处理）。 */
     private volatile boolean forceCloseOnNoReader;
+
+    /**
+     * ZLM 回调之后的后续处理执行器（单线程、保序、守护）。
+     *
+     * <p><b>为什么必须有它</b>：ZLM 的回调是在它自己的 event poller 线程上
+     * 同步调进来的（JNA 把该原生线程 attach 成 Java 线程 {@code zlm-callback}）。
+     * 只要回调函数不返回，那个 poller 就<b>什么都不做</b> —— 不收 RTP、
+     * 不跑转协议、不处理定时任务。而业务侧的监听者会做这些重活：
+     *
+     * <ul>
+     *   <li>{@code RecordingService.onStreamOnline → mk_recorder_start}（原生调用）；</li>
+     *   <li>{@code RecordingService.onStreamOffline → mk_recorder_stop}
+     *       + <b>最多等 10 秒</b>等 MP4 收尾（{@code stopRecording} 里的轮询）；</li>
+     *   <li>Spring 侧的落库、状态机、归档准备。</li>
+     * </ul>
+     *
+     * <p>把这些都放在 poller 线程上做，等于让 ZLM 的收流主循环卡住：
+     * RTP 包积压 → {@code RtpProcess timeout} → 触发流下线 → 又进一轮回调，
+     * 雪崩。实测崩溃线程正是 {@code zlm-callback}
+     * （hs_err：{@code SIGSEGV in getCodecByMpegId}）。
+     *
+     * <p><b>单线程而非线程池</b>：上线/下线事件的<b>顺序</b>有语义
+     * （先上线再下线，否则会话状态机错乱）。单线程天然保序。
+     *
+     * <p><b>绝不能在回调线程里重入 ZLM 的销毁类 API</b>：ZLM 销毁
+     * {@code MultiMediaSourceMuxer} 时会遍历内部列表，此时重入会把它
+     * 从正在执行的栈上拆掉，表现为 {@code MediaSourceEvent::NotImplemented}
+     * 逃逸出析构函数 → {@code std::terminate()} → SIGABRT，或直接 SIGSEGV。
+     * 本执行器就是那道隔离墙。
+     */
+    private volatile java.util.concurrent.ExecutorService eventExecutor;
 
     /** MP4 录制分片落盘监听者。 */
     private volatile RecordListener recordListener;
@@ -268,6 +300,13 @@ public class ZlmMediaServer {
         if (started.get()) {
             return;
         }
+        // 回调后续执行器：必须在 buildEvents() 之前建好，回调闭包要捕获它。
+        // 单线程 + 守护：开机即存在，进程退出时不会拖住 JVM。
+        eventExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "zlm-event-worker");
+            t.setDaemon(true);
+            return t;
+        });
         ZLMApi a = api();
         // 负载类型需在 env 初始化前写入全局配置（国标默认 PS=96）
         applyPayloadTypes(a);
@@ -344,6 +383,28 @@ public class ZlmMediaServer {
         }
     }
 
+    /**
+     * 把回调后续处理投递到 {@link #eventExecutor}，让 ZLM 的 poller 线程立刻返回。
+     *
+     * <p>已停机（执行器关闭）时静默丢弃：停机后流上下线事件已无业务意义，
+     * 而此时打日志只会污染退出过程。
+     *
+     * <p>本方法自身绝不可抛异常 —— 它在 ZLM 回调栈上执行，
+     * 异常逃逸到原生侧同样是未定义行为。
+     */
+    private void dispatch(Runnable task) {
+        java.util.concurrent.ExecutorService ex = eventExecutor;
+        if (ex == null || ex.isShutdown()) {
+            return;
+        }
+        try {
+            ex.execute(task);
+        } catch (Throwable t) {
+            // 执行器正在关闭：任务丢弃即可，不要回抛给原生回调
+            log.debug("事件执行器已关闭，丢弃任务: {}", t.toString());
+        }
+    }
+
     /** 停止所有服务。幂等。 */
     public synchronized void stop() {
         if (!started.compareAndSet(true, false)) {
@@ -365,6 +426,28 @@ public class ZlmMediaServer {
             log.warn("停止 ZLMediaKit 异常", t);
         } finally {
             httpPort = rtmpPort = rtspPort = rtcPort = 0;
+            // 回调已清零，不会再有新任务进来：把已排队的处理跑完再关。
+            // 队列里通常只有几条上下线事件，5 秒足够；超时则丢弃，
+            // 留给下次启动时的录像对账（RecordService#reconcileAutoRecordings）。
+            shutdownEventExecutor();
+        }
+    }
+
+    /** 关闭回调执行器：先等在跑的任务结束，超时则中断。 */
+    private void shutdownEventExecutor() {
+        java.util.concurrent.ExecutorService ex = eventExecutor;
+        eventExecutor = null;
+        if (ex == null) {
+            return;
+        }
+        ex.shutdown();
+        try {
+            if (!ex.awaitTermination(5, TimeUnit.SECONDS)) {
+                ex.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            ex.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -821,6 +904,40 @@ public class ZlmMediaServer {
     }
 
     /**
+     * 运行时修改一个 ZLM 配置项（无需重启）。
+     *
+     * <p><b>只对 ZLM 每次读取的配置有效</b>：{@code mk_set_option} 写的是 ZLM 的
+     * 全局 ini 内存镜像，因此像 {@code general.streamNoneReaderDelayMS}
+     * （ZLM 在判断无人观看时才读）能立即生效；而
+     * {@code rtp.ps_pt}（在 {@code mk_env_init2} 时固化为载荷类型）、
+     * 各种 {@code *server_start} 端口号只读一次，改它们必须重启。
+     *
+     * <p>调用方（平台侧运行时配置）只应暴露前者，把后者放进
+     * application.yml —— 否则界面上会显示「已保存」却不生效。
+     *
+     * @param key   ZLM 配置键（含段名，如 {@code general.streamNoneReaderDelayMS}）
+     * @param value 值
+     * @return 是否成功写入
+     */
+    public boolean applyOption(String key, String value) {
+        if (key == null || value == null || value.isEmpty()) {
+            return false;
+        }
+        if (!started.get()) {
+            log.warn("ZLM 未启动，忽略运行时配置: {}={}", key, value);
+            return false;
+        }
+        try {
+            api().mk_set_option(key, value);
+            log.info("ZLM 运行时配置已更新: {}={}", key, value);
+            return true;
+        } catch (Throwable t) {
+            log.warn("设置 ZLM 运行时配置 {}={} 失败: {}", key, value, t.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * 设置 ZLM 配置项。
      *
      * <p>库模式（{@code Native.load("mk_api")}）没有 ini 文件，
@@ -984,19 +1101,25 @@ public class ZlmMediaServer {
             try {
                 String app = a.mk_media_source_get_app(source);
                 String stream = a.mk_media_source_get_stream(source);
-                // 依次通知全部监听者：单个监听者抛异常不能影响其它监听者
-                for (StreamListener l : streamListeners) {
-                    try {
-                        if (regist != 0) {
-                            l.onStreamOnline(app, stream);
-                        } else {
-                            l.onStreamOffline(app, stream);
+                final boolean online = regist != 0;
+                // 只取字段，然后立刻返回：监听者会做 mk_recorder_start/stop
+                // 甚至等 MP4 收尾，放在这里会把 ZLM 的 event poller 卡住
+                // （详见 eventExecutor 的字段注释）。
+                dispatch(() -> {
+                    // 依次通知全部监听者：单个监听者抛异常不能影响其它监听者
+                    for (StreamListener l : streamListeners) {
+                        try {
+                            if (online) {
+                                l.onStreamOnline(app, stream);
+                            } else {
+                                l.onStreamOffline(app, stream);
+                            }
+                        } catch (Throwable t) {
+                            log.warn("流事件监听者处理失败: app={} stream={} regist={}",
+                                    app, stream, regist, t);
                         }
-                    } catch (Throwable t) {
-                        log.warn("流事件监听者处理失败: app={} stream={} regist={}",
-                                app, stream, regist, t);
                     }
-                }
+                });
             } catch (Throwable t) {
                 log.warn("处理 on_mk_media_changed 异常", t);
             }
@@ -1004,7 +1127,6 @@ public class ZlmMediaServer {
 
         // 无人观看回调（依赖 general.streamNoneReaderDelayMS 配置生效）：
         // 超过该时长仍无播放者时触发。平台据此发 BYE 释放设备带宽。
-        // force=1 立即关闭该流，force=0 走正常关闭流程。
         ev.on_mk_media_no_reader = new com.aizuda.zlm4j.callback.IMKNoReaderCallBack() {
             @Override
             public void invoke(com.aizuda.zlm4j.structure.MK_MEDIA_SOURCE ctx) {
@@ -1012,15 +1134,33 @@ public class ZlmMediaServer {
                     String app = a.mk_media_source_get_app(ctx);
                     String stream = a.mk_media_source_get_stream(ctx);
                     String schema = a.mk_media_source_get_schema(ctx);
+                    final boolean force = forceCloseOnNoReader;
                     log.info("流无观看者: schema={} app={} stream={}", schema, app, stream);
-                    NoReaderListener l = noReaderListener;
-                    if (l != null) {
-                        l.onNoReader(app, stream, schema);
-                    }
-                    if (forceCloseOnNoReader) {
-                        a.mk_media_source_close(ctx, 1);
-                        log.info("已按无人观看策略关闭流: {}:{}", app, stream);
-                    }
+                    // 关键：<b>不能</b>在这里调 mk_media_source_close(ctx, 1)。
+                    //
+                    // 本回调是在 ZLM 遍历「无人观看」监听链的过程中同步调进来的，
+                    // 此刻直接销毁该源 = 把自己正在执行的栈拆掉：源对象被释放后
+                    // 回调返回，ZLM 继续访问已释放的 this → SIGSEGV，
+                    // 或在 MultiMediaSourceMuxer 析构链上抛
+                    // MediaSourceEvent::NotImplemented → std::terminate() → SIGABRT。
+                    //
+                    // 改为投递到 eventExecutor，用已加固的两阶段 closeMediaSource
+                    // （先遍历收集句柄、遍历结束后再关）按 app/stream 关，
+                    // 不回传 ctx 指针 —— ctx 在回调返回后即失效，跨线程持有必崩。
+                    dispatch(() -> {
+                        NoReaderListener l = noReaderListener;
+                        if (l != null) {
+                            try {
+                                l.onNoReader(app, stream, schema);
+                            } catch (Throwable t) {
+                                log.warn("无人观看监听者处理失败: {}:{} {}", app, stream, t.toString());
+                            }
+                        }
+                        if (force) {
+                            int n = closeMediaSource(app, stream);
+                            log.info("已按无人观看策略关闭流: {}:{} 关闭 {} 个源", app, stream, n);
+                        }
+                    });
                 } catch (Throwable t) {
                     log.warn("处理无人观看回调异常", t);
                 }
