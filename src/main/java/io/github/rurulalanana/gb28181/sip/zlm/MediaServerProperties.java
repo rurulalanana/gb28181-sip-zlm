@@ -41,6 +41,23 @@ public class MediaServerProperties {
     private final String sipHost = "0.0.0.0";
 
     /**
+     * SIP 信令监听的传输协议，逗号分隔（默认 {@code UDP,TCP}）。
+     *
+     * <p><b>为什么要同时监听两种</b>：GB/T 28181 规定设备可用 UDP 或 TCP 传输
+     * 信令，由设备侧配置决定。只监听 UDP 时，配成 TCP 的设备<b>根本注册不上</b>——
+     * 表现为设备侧显示「注册超时」、平台日志里一条记录都没有，
+     * 排查时极易误判成网络不通或鉴权失败。
+     *
+     * <p>两个协议共用 {@link #sipPort}：SIP 的 UDP 与 TCP 是不同传输层，
+     * 同端口互不冲突。
+     *
+     * <p>取值示例：{@code "UDP,TCP"}（默认）、{@code "UDP"}（只 UDP）、
+     * {@code "TCP"}（只 TCP）。大小写不敏感，重复项自动去重。
+     */
+    @Builder.Default
+    private final String sipTransports = "UDP,TCP";
+
+    /**
      * SIP 对外通告地址（写入 INVITE 的 From / Contact）。
      *
      * <p>留空时自动推断本机非回环 IPv4（与 {@link #mediaIp} 同源）。

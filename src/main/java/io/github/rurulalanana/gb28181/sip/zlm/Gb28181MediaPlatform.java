@@ -144,7 +144,9 @@ public class Gb28181MediaPlatform implements AutoCloseable {
                 .host(props.getSipHost())
                 .advertisedHost(props.getSipAdvertisedIp())
                 .port(props.getSipPort())
-                .transport("UDP")
+                // 默认 "UDP,TCP"：国标允许设备用任一传输层发信令，
+                // 只监听 UDP 会让配成 TCP 的设备根本注册不上（详见 sipTransports 注释）
+                .transport(props.getSipTransports())
                 .callback(mediaService)
                 .credentialProvider(resolveCredentialProvider(props))
                 .build()
