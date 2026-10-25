@@ -149,6 +149,9 @@ public class Gb28181MediaPlatform implements AutoCloseable {
                 .transport(props.getSipTransports())
                 .callback(mediaService)
                 .credentialProvider(resolveCredentialProvider(props))
+                // 接入控制（黑白名单）：未设置则不限制来源。
+                // 与上面凭据提供者是独立的两道闸门，在摘要认证之前生效。
+                .accessControl(props.getAccessControl())
                 .build()
                 .start();
         mediaService.attach(sipServer);

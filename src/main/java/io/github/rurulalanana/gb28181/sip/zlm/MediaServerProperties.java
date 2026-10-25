@@ -94,6 +94,18 @@ public class MediaServerProperties {
     @Builder.Default
     private final io.github.rurulalanana.gb28181.sip.security.CredentialProvider credentialProvider = null;
 
+    /**
+     * 接入控制（黑白名单，扩展点）。
+     *
+     * <p>与 {@link #credentialProvider} 是两道<b>独立</b>的闸门：前者回答
+     * 「密码对不对」，本项回答「这个来源许不许进」。在摘要认证<b>之前</b>生效，
+     * 因此黑名单里的设备即使密码正确也进不来。
+     *
+     * <p>不设置（默认）则完全不限制来源，与加此功能之前的行为一致。
+     */
+    @Builder.Default
+    private final io.github.rurulalanana.gb28181.sip.security.AccessControl accessControl = null;
+
     /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 自动选空闲端口。 */
     @Builder.Default
     private final int httpPort = 8080;
