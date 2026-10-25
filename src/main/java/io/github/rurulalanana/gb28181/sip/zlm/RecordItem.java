@@ -181,6 +181,26 @@ public class RecordItem {
         return fmt.format(date);
     }
 
+    /**
+     * 时间的 <b>UNIX 秒</b>表示，用于 SDP 的 {@code t=} 行。
+     *
+     * <p><b>{@code t=} 必须是整数，不能写 ISO 时间字符串</b>。
+     * RFC 4566 规定 {@code t=} 是 NTP 时间戳（自 1900 年的秒数），
+     * 国标设备与平台普遍按「1970 起的秒数」解析（WVP-GB28181-pro 同样用
+     * {@code Instant.getEpochSecond()}）。
+     * 实测写 {@code t=2026-10-20T10:00:00 2026-10-20T12:00:00} 会被
+     * LiveGBS 直接拒绝：
+     * <pre>
+     * SIP/2.0 400 parse invite sdp error, sdp: strconv.ParseInt:
+     * parsing "2026-10-20T10:00:00": invalid syntax on line 6
+     * </pre>
+     *
+     * @return UNIX 秒；{@code date} 为 {@code null} 时返回 0
+     */
+    public static long epochSecond(Date date) {
+        return date == null ? 0L : date.getTime() / 1000L;
+    }
+
     private static String text(Element item, String tag) {
         NodeList nodes = item.getElementsByTagName(tag);
         if (nodes == null || nodes.getLength() == 0) {

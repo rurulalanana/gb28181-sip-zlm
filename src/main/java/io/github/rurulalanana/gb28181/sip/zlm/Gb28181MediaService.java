@@ -1128,27 +1128,71 @@ public class Gb28181MediaService implements SipCallback {
     /**
      * 构造历史回放 SDP（标准 9.8）：{@code s=Playback} + {@code u=文件路径} + {@code t=时间段}。
      */
+    /**
+     * 构造历史回放的 SDP offer（标准 9.8 / 附录 G）。
+     *
+     * <p>字段取值对照 WVP-GB28181-pro 的 {@code playbackStreamCmd}
+     * （实测与 LiveGBS、海康、大华互通）：
+     * <pre>
+     * v=0
+     * o=&lt;平台编码&gt; 0 0 IN IP4 &lt;收流地址&gt;
+     * s=Playback
+     * u=&lt;通道编码&gt;:0            ← 按时间回放；按文件回放时填真实 FilePath
+     * c=IN IP4 &lt;收流地址&gt;
+     * t=&lt;起始 UNIX 秒&gt; &lt;结束 UNIX 秒&gt;   ← 必须是整数！
+     * m=video &lt;端口&gt; RTP/AVP 96 97 98 99
+     * a=recvonly
+     * a=rtpmap:96 PS/90000 …
+     * y=&lt;SSRC&gt;
+     * </pre>
+     *
+     * <p><b>三个曾经踩过的坑</b>：
+     * <ol>
+     *   <li>{@code t=} 写成 ISO 时间字符串 → LiveGBS 直接回
+     *       {@code 400 parse invite sdp error ... strconv.ParseInt}，
+     *       设备根本不会推流。必须用 UNIX 秒。</li>
+     *   <li>{@code u=} 写时间区间 → 非标准。按时间回放时标准写法是
+     *       {@code <通道编码>:0}，设备据此自己按 {@code t=} 定位录像。</li>
+     *   <li>只宣告 pt=96 且漏掉 {@code a=recvonly} → 部分设备解析后回 500。
+     *       实时点播的 SDP 早就写成 96 97 98 99 + recvonly 且稳定工作，
+     *       回放没有理由不同。</li>
+     * </ol>
+     */
     SdpMessage buildPlaybackSdp(RtpSession session, RecordItem item) {
-        SdpMessage sdp = new SdpMessage()
+        long start = RecordItem.epochSecond(item.getStartTime());
+        long end = RecordItem.epochSecond(item.getEndTime());
+        // t= 为「会话活跃时间」：结束时间未知时退化为起点（标准允许）
+        String timeRange = (start <= 0 ? 0 : start) + " "
+                + (end <= 0 ? Math.max(start, 0) : end);
+        /*
+         * u= 的语义：
+         *   - 设备给了真实 FilePath → 按文件回放，填路径（2022 版 A.2.5.3）
+         *   - 否则 → 按时间回放，填「通道编码:0」（2016 版 9.8 的写法，设备
+         *     据此结合 t= 自行定位录像段）
+         * session.getMediaUri() 可能被写成内部的「起/止时间」身份串，
+         * 那不是合法 u=，所以这里以 item.getFilePath() 为准。
+         */
+        String uri = item.getFilePath();
+        if (uri == null || uri.trim().isEmpty()) {
+            String channel = session.getChannelId() == null
+                    ? session.getDeviceId() : session.getChannelId();
+            uri = (channel == null ? "" : channel) + ":0";
+        }
+        return new SdpMessage()
                 .origin(props.getPlatformId(), props.getMediaIp())
                 .sessionName(SdpMessage.S_PLAYBACK)
-                // u= 用会话身份（FilePath，或退化为「起/止时间」）：
-                // 空 u= 会让部分平台无法定位录像而直接不应答
-                .uri(session.getMediaUri() != null
-                        ? session.getMediaUri() : item.getFilePath())
+                .uri(uri)
                 .connection(props.getMediaIp())
+                .time(timeRange)
                 .mediaPort(session.getPort())
                 .mediaProto(SdpMessage.PROTO_UDP)
-                .payloadType("96")
+                .payloadType("96 97 98 99")
                 .rtpmap("96", "PS")
+                .rtpmap("98", "H264")
+                .rtpmap("97", "MPEG4")
+                .rtpmap("99", "H265")
+                .recvonly()
                 .ssrc(session.getSsrc());
-        String start = RecordItem.formatTime(item.getStartTime());
-        String end = RecordItem.formatTime(item.getEndTime());
-        sdp.time((start == null ? "0" : start) + " " + (end == null ? "0" : end));
-        if (item.getFileSize() > 0) {
-            sdp.filesize(item.getFileSize());
-        }
-        return sdp;
     }
 
     private void reject(InviteEvent event, int statusCode) {
