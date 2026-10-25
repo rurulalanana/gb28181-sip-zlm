@@ -400,22 +400,33 @@ public class Gb28181MediaService implements SipCallback {
     /**
      * 平台主动文件下载（标准 9.9）：设备把文件流推到平台收流端口。
      *
+     * <p>与回放的差别只有 {@code s=}：下载是 {@code Download}、回放是
+     * {@code Playback}。两者 SDP 的其余结构（{@code u=} / {@code t=} /
+     * {@code m=} / {@code a=recvonly}）完全一致，因此复用同一个构造器，
+     * 只把 sessionName 换掉。
+     *
+     * <p><b>上一版这里用的 {@code buildAnswerSdp} 是错的</b>：那是给
+     * 被动收流（设备 INVITE 我们）用的，{@code t=} 固定写 {@code 0 0}。
+     * 下载必须给出真实时间区间，否则设备不知道要打包哪一段。
+     *
      * @param deviceId  设备编码（SIP 目标）
      * @param channelId 通道编码；{@code null} 或与设备编码相同表示设备自身
-     * @param filePath  设备侧文件路径（来自 RecordInfo 的 FilePath）
+     * @param item      要下载的录像段（含时间区间；有 FilePath 时用路径）
      */
-    public RtpSession download(String deviceId, String channelId, String filePath) {
+    public RtpSession download(String deviceId, String channelId, RecordItem item) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
+        String mediaUri = recordIdentity(item);
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
-                MediaType.DOWNLOAD, filePath);
+                MediaType.DOWNLOAD, mediaUri);
         try {
-            SdpMessage offer = buildAnswerSdp(session, false);
+            SdpMessage offer = buildPlaybackSdp(session, item)
+                    .sessionName(SdpMessage.S_DOWNLOAD);
             // Subject 传 null：由 sip 模块按标准生成
-            // <通道编码>:<SSRC>,<平台编码>:0（此处 SDP 的 y= 已由 buildAnswerSdp 填好）
+            // <通道编码>:<SSRC>,<平台编码>:0
             String callId = client().invite(deviceId, channel, offer, null);
             sessionManager.bindCallId(session, callId);
-            log.info("已发起下载 INVITE: {} file={} callId={}",
-                    session, filePath, callId);
+            log.info("已发起下载 INVITE: {} mediaUri={} callId={}",
+                    session, mediaUri, callId);
             return session;
         } catch (RuntimeException e) {
             // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
@@ -424,40 +435,103 @@ public class Gb28181MediaService implements SipCallback {
         }
     }
 
+    /**
+     * 录像段的「会话身份」：有 FilePath 用它，否则用「起/止时间」。
+     *
+     * <p>用于区分不同录像段，<b>不是</b> SDP 的 {@code u=}（那个由
+     * {@link #buildPlaybackSdp} 单独决定）。
+     */
+    static String recordIdentity(RecordItem item) {
+        if (item == null) {
+            return null;
+        }
+        if (item.getFilePath() != null && !item.getFilePath().trim().isEmpty()) {
+            return item.getFilePath();
+        }
+        String start = RecordItem.formatTime(item.getStartTime());
+        if (start == null) {
+            return null;
+        }
+        String end = RecordItem.formatTime(item.getEndTime());
+        return start + "/" + (end == null ? start : end);
+    }
+
     /** 平台主动文件下载（设备直连：设备编码即通道编码）。 */
-    public RtpSession download(String deviceId, String filePath) {
-        return download(deviceId, deviceId, filePath);
+    public RtpSession download(String deviceId, RecordItem item) {
+        return download(deviceId, deviceId, item);
     }
 
     /**
-     * 历史回放控制（标准附录 D，RFC 2976）：播放 / 暂停 / 跳转 / 倍速。
+     * 历史回放控制（标准 9.8 / 附录 D，经 {@code INFO} 下发）。
      *
-     * @param callId 回放 INVITE 的 Call-ID
-     * @param from   跳转目标时间（SEEK 使用）
-     * @param scale  倍速（SPEED 使用，1.0 为正常）
+     * <p><b>消息体是 RTSP 风格文本，不是 SDP</b> —— 这是最容易被
+     * 「SDP 里放 u=play」这种写法带偏的地方。实测设备（LiveGBS、
+     * 海康、大华系）只认 RTSP 风格：
+     * <pre>
+     * 暂停：PAUSE RTSP/1.0\r\nCSeq: N\r\nPauseTime: now\r\n
+     * 继续：PLAY  RTSP/1.0\r\nCSeq: N\r\nRange: npt=now-\r\n
+     * 拖动：PLAY  RTSP/1.0\r\nCSeq: N\r\nRange: npt=&lt;相对秒数&gt;-\r\n
+     * 倍速：PLAY  RTSP/1.0\r\nCSeq: N\r\nScale: &lt;浮点&gt;\r\n
+     * </pre>
+     * 与 WVP-GB28181-pro 的 {@code playSeekCmd} / {@code playPauseCmd}
+     * / {@code playResumeCmd} / {@code playSpeedCmd} 完全一致。
+     *
+     * @param deviceId 设备编码
+     * @param callId   回放 INVITE 的 Call-ID（INFO 要落在该对话框内）
+     * @param command  命令
+     * @param seekSecond 拖动目标：<b>相对本段录像起点的秒数</b>。
+     *                注意不是绝对时间戳 —— 国标设备的 npt 是段内偏移，
+     *                传绝对秒数会跳到「开播 N 年后」而立即结束。
+     * @param scale    倍速（SPEED 使用；1.0 为正常）
      */
     public void playbackControl(String deviceId, String callId, PlaybackCommand command,
-                                Date from, float scale) {
-        SdpMessage sdp = new SdpMessage()
-                .origin(props.getPlatformId(), props.getMediaIp())
-                .uri(command.command())
-                .sessionName("Playback")
-                .realtime();
-        if (command == PlaybackCommand.SEEK && from != null) {
-            String text = RecordItem.formatTime(from);
-            sdp.time(text + " " + text);
-        }
-        if (command == PlaybackCommand.SPEED) {
-            sdp.attr("Scale: " + scale);
-        }
+                                long seekSecond, float scale) {
         // 通道编码从会话取：INFO 必须在 INVITE 对话框内（RFC 2976），
         // Request-URI / To 要与回放 INVITE 一致（都是通道编码），
         // 而调用方只持有 callId 与设备编码，此处按 callId 反查通道
         RtpSession session = sessionManager.getByCallId(callId);
         String channel = session == null ? deviceId : session.getChannelId();
-        client().info(deviceId, channel, callId, sdp);
-        log.info("发送回放控制: channel={} callId={} command={} scale={}",
-                channel, callId, command.command(), scale);
+
+        StringBuilder body = new StringBuilder(96);
+        switch (command) {
+            case PAUSE:
+                body.append("PAUSE RTSP/1.0\r\n")
+                        .append("CSeq: ").append(nextControlCSeq(callId)).append("\r\n")
+                        .append("PauseTime: now\r\n");
+                break;
+            case RESUME:
+                body.append("PLAY RTSP/1.0\r\n")
+                        .append("CSeq: ").append(nextControlCSeq(callId)).append("\r\n")
+                        .append("Range: npt=now-\r\n");
+                break;
+            case SEEK:
+                body.append("PLAY RTSP/1.0\r\n")
+                        .append("CSeq: ").append(nextControlCSeq(callId)).append("\r\n")
+                        .append("Range: npt=").append(Math.max(0L, seekSecond))
+                        .append("-\r\n");
+                break;
+            case SPEED:
+                body.append("PLAY RTSP/1.0\r\n")
+                        .append("CSeq: ").append(nextControlCSeq(callId)).append("\r\n")
+                        .append("Scale: ").append(String.format("%.6f", scale))
+                        .append("\r\n");
+                break;
+            default:
+                log.warn("不支持的回放控制命令: {}", command);
+                return;
+        }
+        client().infoRaw(deviceId, channel, callId, "application/MANSRTSP", body.toString());
+        log.info("发送回放控制: channel={} callId={} command={} seek={}s scale={}",
+                channel, callId, command, seekSecond, scale);
+    }
+
+    /** 回放控制的 CSeq：同一会话内递增，设备按它去重。 */
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> controlCSeq
+            = new ConcurrentHashMap<>();
+
+    private long nextControlCSeq(String callId) {
+        return controlCSeq.computeIfAbsent(callId,
+                k -> new java.util.concurrent.atomic.AtomicLong(1L)).getAndIncrement();
     }
 
     /**
@@ -1205,25 +1279,15 @@ public class Gb28181MediaService implements SipCallback {
 
     /** 回放控制命令（标准附录 D 的 {@code u=} 取值）。 */
     public enum PlaybackCommand {
-        /** 播放/继续。 */
-        PLAY("play"),
+        /** 播放（从当前位置继续）。 */
+        RESUME,
         /** 暂停。 */
-        PAUSE("pause"),
-        /** 跳转到指定时间。 */
-        SEEK("seek"),
-        /** 倍速（配合 {@code a=Scale:}）。 */
-        SPEED("play"),
-        /** 结束回放。 */
-        STOP("stop");
-
-        private final String command;
-
-        PlaybackCommand(String command) {
-            this.command = command;
-        }
-
-        public String command() {
-            return command;
-        }
+        PAUSE,
+        /** 跳转到指定偏移（秒）。 */
+        SEEK,
+        /** 倍速。 */
+        SPEED,
+        /** 结束回放（由 BYE 完成，此处保留语义占位）。 */
+        STOP
     }
 }

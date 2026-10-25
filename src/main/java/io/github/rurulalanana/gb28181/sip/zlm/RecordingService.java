@@ -226,6 +226,70 @@ public class RecordingService implements ZlmMediaServer.StreamListener,
     }
 
     /**
+     * 按<b>明确的 ZLM app/stream</b> 开始录制。
+     *
+     * <p><b>为什么需要它</b>：{@link #startRecording(String)} 只按通道编码
+     * 反查会话，而回放/下载流的 stream 名带 {@code _playback} 后缀
+     * （见 {@code RtpSession#getZlmStream}）。用它录回放流要么找不到、
+     * 要么录到直播流上。设备录像下载正是「把回放流录成 MP4」，
+     * 必须能指定真实流名。
+     *
+     * @param recordKey 录制索引的键（用会话的 streamKey，避免与直播录制撞车）
+     * @param app       ZLM app
+     * @param stream    ZLM stream
+     */
+    public Recording startRecordingStream(String recordKey, String app, String stream) {
+        return startRecordingStream(recordKey, app, stream, 0);
+    }
+
+    /**
+     * 按<b>明确的 ZLM app/stream</b> 开始录制，并指定单片时长。
+     *
+     * <p><b>{@code maxSecond} 对「录像下载」很关键</b>：ZLM 按固定时长切片，
+     * 默认 3600 秒。下载一段 2 小时的录像会被切成 2 个文件，
+     * 而索引只保留<b>最后一片</b>的路径 —— 用户拿到的是半段视频。
+     * 下载时传「片长 &ge; 录像段总长」即可只产出一个完整文件。
+     *
+     * @param maxSecond 单片时长（秒）；{@code <= 0} 用全局配置
+     */
+    public Recording startRecordingStream(String recordKey, String app, String stream,
+                                         int maxSecond) {
+        String existingId = activeByChannel.get(recordKey);
+        if (existingId != null) {
+            Recording existing = index.get(existingId);
+            if (existing != null) {
+                return existing;
+            }
+        }
+        File dir = new File(props.getRecordRoot(), safeDir(recordKey));
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IllegalStateException("创建录像目录失败: " + dir);
+        }
+        String recordId = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        ZLMApi api = ZlmMediaServer.api();
+        int seconds = maxSecond > 0 ? maxSecond : recordMaxSecond();
+        int code = api.mk_recorder_start(RECORDER_TYPE_MP4, props.getVhost(), app,
+                stream, dir.getAbsolutePath(), seconds);
+        if (code != 1) {
+            throw new IllegalStateException("ZLM 启动录制失败，返回码 " + code
+                    + "（" + recordKey + "，媒体源 " + app + "/" + stream + "）");
+        }
+        Recording recording = new Recording(recordId, recordKey, app, stream,
+                null, null, System.currentTimeMillis());
+        index.put(recordId, recording);
+        activeByChannel.put(recordKey, recordId);
+        activeBySource.put(sourceKey(app, stream), recording);
+        log.info("开始录制指定流: key={} source={}/{} 片长={}s dir={}", recordKey, app,
+                stream, seconds, dir.getAbsolutePath());
+        return recording;
+    }
+
+    /** 目录名安全化：会话键里有 {@code /} 和 {@code _playback} 等字符。 */
+    private static String safeDir(String key) {
+        return key == null ? "unknown" : key.replaceAll("[^A-Za-z0-9_-]", "_");
+    }
+
+    /**
      * 停止录制某通道并归档索引。
      *
      * <p><b>会等待最后一个分片落盘</b>：ZLM 关闭 MP4 文件是异步的
