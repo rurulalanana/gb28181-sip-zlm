@@ -210,13 +210,16 @@ rm -rf ~/.m2/repository/com/aizuda/zlm4j   # 仍不行则清缓存重下
 | `UnsatisfiedLinkError` / 加载 `mk_api` 失败 | zlm4j 1.12.0 内含 win/linux/mac（x86_64 与 arm64）原生库，检查是否被裁剪或平台不支持 |
 | 媒体服务"启动失败"但无堆栈 | `mk_http_server_start` 等**返回 0 而不抛异常**，需看 ZLM 原生日志判断 |
 | 端口明明空闲却报启动失败 | ZLM 返回 `uint16_t`，若经有符号 `short` 中转会变负数；本模块已按无符号解读 |
+| 调用 `mk_media_source_start_send_rtp3` 后**一个包都没发出去**，Java 侧无异常无返回值 | **第 5 个参数是 `con_type` 不是载荷类型**（0=tcp主动 1=udp主动 2=tcp被动 3=udp被动）。传 96 / -1 会落进 `RtpSender.cpp` 的 `switch` default，触发 `Assertion failed: (0, invalid con type)`，而该断言**只出现在 ZLM 原生控制台**，Java 完全静默 |
+| 级联推流"失败"但其实源是好的 | 用 `mk_media_source_find2` 可能对**已存在**的源返回 null；改用 `mk_media_source_for_each` 遍历匹配 app/stream 更可靠 |
+| 结果回调里本地端口是负数 | 端口是 16 位无符号，JNA 映射成有符号 `short`；打印时按 `port & 0xFFFF` 处理 |
 
 ## 已知限制
 
 - **未做真实 RTP/PS 媒体流验证**：E2E 验证到信令协商 + RTP 服务器生命周期 + 录制/转推句柄可用性；完整媒体链路（设备推流 → 画面出流 → 出录像文件）需要真实 GB28181 设备（或 EasyGBD 模拟）验证
 - **对讲非双向**：ZLM C API 无 talk 能力，只能上行收 + 下行发
 - **录像索引在内存**：重启丢失，多实例不共享，需要持久化请自行落库（`RecordingService` 可作为数据源）
-- **级联转发为 UDP 单向**：`startSendRtp` 走 UDP，上级要求 TCP 主动连接需上层另行处理
+- **级联上行推流**：已支持 UDP 主动（`startSendRtpToSource`）与 TCP 主动（`con_type=0`，固定源端口 `TCP_SRC_PORT`）；TCP **被动**（2）与 UDP **被动**（3）需要上级先连入，当前未使用
 - ZLMediaKit 的 HTTP RESTful API 在嵌入模式下不可用，业务查询请用事件回调或自行扩展
 
 ## License

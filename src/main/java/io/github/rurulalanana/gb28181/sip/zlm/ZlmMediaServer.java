@@ -639,70 +639,22 @@ public class ZlmMediaServer {
     // ==================== 级联上行推流 ====================
 
     /**
-     * 已提交给 ZLM、但尚未释放的 INI 参数。
+     * TCP 主动推流时使用的本地源端口。
      *
-     * <p><b>为什么需要延迟释放</b>：{@code mk_media_source_start_send_rtp3} 内部是
-     * {@code (*src)([=](MediaSource &sender){ ... })} —— 把任务<b>异步</b>投递到
-     * ZLM 的 event poller，而 {@code ini} 是按<b>引用</b>传进去的。
-     * 一旦在 API 返回后立刻 {@code mk_ini_release}，异步任务真正读取时内存已释放，
-     * 读到的 {@code udp} 键是垃圾值，{@code RtpSender} 的传输类型变回无效，
-     * 于是 {@code startSend} 断言失败、一个包都发不出去。
-     *
-     * <p>实测时序证据：我们的「推流已启动」日志与 ZLM 的断言只差 <b>3 毫秒</b> ——
-     * 正是异步任务开始执行、读到已释放内存的时刻。
-     *
-     * <p>代价：每次级联点播保留一个几十字节的 INI 对象 60 秒。级联点播是低频操作
-     * （一天几十次），完全可接受；比起「静默发不出流」这种排查成本极低的故障，
-     * 这个取舍很划算。
+     * <p>固定端口是为了让上级防火墙能按端口放通 —— 随机端口意味着
+     * 对端每次都要重新判断来源，在多级级联里尤其麻烦。
+     * 该端口只用于向外的 TCP 连接，不与本机其它服务冲突。
      */
-    private final java.util.Queue<PendingIni> pendingInis =
-            new java.util.concurrent.ConcurrentLinkedQueue<>();
-
-    /** 延迟释放窗口：足够覆盖 ZLM 异步任务与首帧发送。 */
-    private static final long INI_RELEASE_DELAY_MS = 60_000L;
-
-    /** 一个待释放的 INI。 */
-    private static final class PendingIni {
-        private final com.aizuda.zlm4j.structure.MK_INI ini;
-        private final long createdAt = System.currentTimeMillis();
-
-        private PendingIni(com.aizuda.zlm4j.structure.MK_INI ini) {
-            this.ini = ini;
-        }
-    }
-
-    /**
-     * dump INI 内容（诊断用）。
-     *
-     * <p>返回的字符串由 ZLM 分配，用完需按 C 侧约定释放；这里只读不释放 ——
-     * 泄漏量极小（每次级联点播一次），换来的是「能看清 ZLM 到底读到了什么」，
-     * 而这个信息在别处拿不到。
-     */
-    private static String dumpIni(com.aizuda.zlm4j.structure.MK_INI ini) {
-        if (ini == null) {
-            return "(null)";
-        }
-        try {
-            com.sun.jna.Pointer p = api().mk_ini_dump_string(ini);
-            if (p == null) {
-                return "(dump=null)";
-            }
-            String s = p.getString(0, "UTF-8");
-            // 日志里换行会打断阅读，改成可见分隔
-            return s == null ? "(empty)" : s.replace("\n", " | ").trim();
-        } catch (Throwable t) {
-            return "(dump失败:" + t.getMessage() + ")";
-        }
-    }
+    private static final int TCP_SRC_PORT = 32050;
 
     /**
      * 按 app/stream 查找已存在的媒体源。
      *
      * <p><b>为什么用 {@code mk_media_source_for_each} 而不是
      * {@code mk_media_source_find2}</b>：实测后者在嵌入式 ZLM 上即使流确实存在
-     * （同一时刻 {@code for_each} 能遍历到、且设备已在推流）也返回 {@code null}，
-     * 它的参数语义与预期不符。而 {@code for_each} 在本项目的
-     * {@link #closeMediaSource} 里已被验证可用，行为可预测。
+     * （同一时刻 {@code for_each} 能遍历到、设备也在推流）也返回 {@code null}。
+     * 官方示例用的是 find2 且参数为 (schema, vhost, app, stream)，这里改用
+     * 本项目已验证可用的 {@link #closeMediaSource} 同款遍历，行为可预测。
      *
      * @return 媒体源句柄；不存在返回 {@code null}
      */
@@ -736,23 +688,6 @@ public class ZlmMediaServer {
         return found.get();
     }
 
-    /** 释放已超过延迟窗口的 INI。 */
-    private void releaseExpiredInis() {
-        long now = System.currentTimeMillis();
-        while (true) {
-            PendingIni head = pendingInis.peek();
-            if (head == null || now - head.createdAt < INI_RELEASE_DELAY_MS) {
-                return;
-            }
-            pendingInis.poll();
-            try {
-                api().mk_ini_release(head.ini);
-            } catch (Throwable t) {
-                log.debug("释放 INI 失败（忽略）: {}", t.toString());
-            }
-        }
-    }
-
     /**
      * 把<b>已有的</b>媒体源用 PS/RTP 推给上级平台（国标级联上行点播）。
      *
@@ -775,57 +710,139 @@ public class ZlmMediaServer {
      */
     public boolean startSendRtpToSource(String app, String stream, String dstIp, int dstPort,
                                         String ssrc, long waitMs) {
+        return startSendRtpToSource(app, stream, dstIp, dstPort, ssrc, waitMs, false);
+    }
+
+    /**
+     * 把<b>已有的</b>媒体源用 PS/RTP 推给上级平台（国标级联上行点播）。
+     *
+     * <p><b>为什么不能沿用 {@code CascadeForwarder} 的写法</b>：那里用的是
+     * {@code mk_media_create} + {@code mk_media_start_send_rtp} —— 参数是一个
+     * <b>我们自己创建的、需要喂帧的</b> {@code MK_MEDIA}。级联上行点播时流已经存在
+     * （设备正在往本级推），我们没有帧可以喂，那条路发不出任何数据。
+     *
+     * <p>正确做法是找到<b>已存在</b>的媒体源，再对它
+     * {@code mk_media_source_start_send_rtp3}。
+     *
+     * <h3>第 5 个参数是 con_type（传输类型），不是载荷类型</h3>
+     * 这一点曾长期搞错并导致连续失败。zlm4j 官方示例写明：
+     * <pre>
+     * // 0: tcp主动，1: udp主动，2: tcp被动，3: udp被动
+     * ZLM_API.mk_media_source_start_send_rtp3(mkMedia, "127.0.0.1", port, ssrc, 1, options, cb, null);
+     * </pre>
+     * 传 96（误以为 pt）或 -1 都落在 RtpSender 的 switch default 分支，
+     * 直接触发
+     * {@code Assertion failed: (0, invalid con type), function startSend,
+     * file src/Rtp/RtpSender.cpp, line 214}，一个包都发不出去。
+     * 而 Java 侧 API 无返回值、不抛异常，只有 ZLM 原生控制台能看到这行断言 ——
+     * 这也是为什么这个问题排查了很久。
+     *
+     * <p>载荷类型不需要我们指定：ZLM 从媒体源自身的 track 取（PS 流固定 96）。
+     *
+     * @param app     媒体源 app（单端口模式下是 {@code rtp}）
+     * @param stream  媒体源 stream（{@code <设备编码>_<通道编码>}）
+     * @param dstIp   上级平台收流地址（来自其 INVITE 的 SDP {@code c=}）
+     * @param dstPort 上级平台收流端口（来自 SDP {@code m=}）
+     * @param ssrc    上级 SDP {@code y=} 指定的 SSRC；空则由 ZLM 用源自身 SSRC
+     * @param waitMs  等待媒体源出现的时长（设备刚被邀请，推流有数百毫秒到数秒延迟）
+     * @param tcp     是否用 TCP 主动推流；{@code false} 为 UDP 主动
+     * @return 是否成功发起（不代表对端已收到，需看回调）
+     */
+    public boolean startSendRtpToSource(String app, String stream, String dstIp, int dstPort,
+                                        String ssrc, long waitMs, boolean tcp) {
         if (dstIp == null || dstIp.trim().isEmpty() || dstPort <= 0) {
             log.warn("级联推流目标地址无效: {}:{}", dstIp, dstPort);
             return false;
         }
         String useApp = app == null || app.trim().isEmpty() ? props.getApp() : app;
-        /*
-         * 只做一次快速探测，不轮询等待。
-         *
-         * 推流本身已确定不可用（原因见下方注释），再等 20 秒等媒体源出现毫无意义 ——
-         * 只会让上级多等 20 秒才拿到失败结果。这里探一次只是为了在日志里
-         * 区分「源都没起来」和「源在但推不出去」两种情况，便于排查。
-         */
-        MK_MEDIA_SOURCE source = findMediaSource(useApp, stream);
+        long deadline = System.currentTimeMillis() + Math.max(1000L, waitMs);
+        MK_MEDIA_SOURCE source = null;
+        // 轮询等源出现：级联点播时设备往往还没开始推流，立刻查找必然为空
+        while (System.currentTimeMillis() < deadline) {
+            source = findMediaSource(useApp, stream);
+            if (source != null) {
+                break;
+            }
+            try {
+                Thread.sleep(300L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         if (source == null) {
-            log.warn("级联推流失败：媒体源不存在 app={} stream={}", useApp, stream);
+            log.warn("级联推流失败：媒体源不存在 app={} stream={}（等待 {}ms）",
+                    useApp, stream, waitMs);
             return false;
         }
-        /*
-         * 【重要：此功能在当前内嵌 ZLM 上不可用，原因已定位到不可修复的层面】
-         *
-         * 调用 mk_media_source_start_send_rtp* 后 ZLM 原生层报：
-         *   Assertion failed: (0, invalid con type), function startSend,
-         *   file src/Rtp/RtpSender.cpp, line 214
-         * RtpSender 的传输类型（UDP/TCP）保持无效值，startSend 直接断言，
-         * 一个 RTP 包都不会发出。
-         *
-         * 已系统排除的可能（附证据）：
-         *   1. 无 ini 的 mk_media_source_start_send_rtp  —— 同样断言
-         *   2. ini 键 udp=1                              —— 同样断言
-         *   3. ini 键 is_udp=1（default/create 两种 ini） —— mk_ini_dump_string
-         *      证实键确实写进了 ZLM 的 mINI 对象，但 RtpSender 不读它
-         *   4. dst_url 带 udp:// 前缀                    —— 同样断言
-         *   5. pt=96 / pt=-1、ssrc=上级值 / null          —— 同样断言
-         *   6. 立即释放 ini（异步读取到已释放内存）        —— 延迟释放后仍断言
-         *   7. 复用被缓存的旧 RtpSender                  —— 先 stop 再 start 仍断言
-         *   8. rtp3 / rtp4 两个变体                      —— 同样断言
-         *
-         * 结论：zlm4j 1.13.0 把 ini 传给 ZLM 原生库的这段链路上，
-         * 传输类型没能传到 RtpSender 构造函数。这是封装层与原生层的兼容问题，
-         * Java 侧没有其它入口可以绕过（C API 不暴露 setConType）。
-         *
-         * 因此这里**如实地返回失败**，而不是像早期版本那样打一条
-         * 「推流已启动」让运维误以为成功（实际上级永远收不到流）。
-         * 级联的注册 / 心跳 / 目录查询应答不受影响，它们工作正常。
-         */
-        log.warn("级联上行推流不可用：内嵌 ZLM（zlm4j 1.13.0）的 "
-                + "mk_media_source_start_send_rtp* 无法指定传输类型，"
-                + "原生层断言 invalid con type，RTP 无法发出。"
-                + "级联注册与目录同步不受影响，上级可见通道但无法播放。"
-                + "目标 {}:{} 源 {}:{}", dstIp, dstPort, useApp, stream);
-        return false;
+        try {
+            /*
+             * 先清掉该源上可能残留的 sender。
+             *
+             * ZLM 按 (ssrc, pt, con_type) 缓存 RtpSender，同 key 会复用。
+             * 若此前用错误参数创建过实例，新调用只会复用而忽略新参数 ——
+             * 先 stop 保证这次是全新构造。
+             */
+            try {
+                api().mk_media_source_stop_send_rtp(source);
+            } catch (Throwable ignore) {
+                // 本来没有 sender 时会失败，忽略
+            }
+
+            String useSsrc = ssrc == null || ssrc.trim().isEmpty() ? null : ssrc.trim();
+
+            // con_type：0=tcp主动 1=udp主动 2=tcp被动 3=udp被动
+            int conType = tcp ? 0 : 1;
+
+            com.aizuda.zlm4j.structure.MK_INI ini = api().mk_ini_create();
+            // close_delay_ms：对端停收后多久自动关闭 sender（官方示例用法）。
+            // 设长一些避免上级短暂抖动就被判定结束；真正结束时我们主动 stop。
+            api().mk_ini_set_option_int(ini, "close_delay_ms", 60000);
+            if (tcp) {
+                // TCP 主动推流时固定本地源端口，便于上级防火墙按端口放通；
+                // 不指定则由系统随机分配，对端每次都要重新判断来源。
+                api().mk_ini_set_option_int(ini, "src_port", TCP_SRC_PORT);
+            }
+
+            // 结果回调：唯一能确认「ZLM 是否真的把流推出去了」的途径
+            com.aizuda.zlm4j.callback.IMKSourceSendRtpResultCallBack cb =
+                    (userData, localPort, err, msg) -> {
+                        if (err == 0) {
+                            // localPort 是 16 位无符号端口，JNA 映射成有符号 short，
+                            // 直接打印会出现 -31126 这样的负数
+                            log.info("级联推流已建立: 本地端口={} → {}:{} ssrc={} con_type={}",
+                                    localPort & 0xFFFF, dstIp, dstPort,
+                                    useSsrc == null ? "(源默认)" : useSsrc, conType);
+                        } else {
+                            log.error("级联推流失败: 目标 {}:{} err={} msg={}",
+                                    dstIp, dstPort, err, msg);
+                        }
+                    };
+            pinCallbackThread(cb);
+
+            api().mk_media_source_start_send_rtp3(source, dstIp, (short) dstPort,
+                    useSsrc, conType, ini, cb, null);
+
+            /*
+             * 按官方示例立即释放 ini。
+             *
+             * 早先担心「ZLM 异步读取、立刻释放会读到已释放内存」（确实观察到过
+             * 断言与我们的日志只差 3ms），但那是把 con_type 传错造成的误判 ——
+             * 官方示例就是调用完立即 release，说明 ZLM 内部会拷贝所需字段。
+             */
+            try {
+                api().mk_ini_release(ini);
+            } catch (Throwable ignore) {
+                // 释放失败不影响推流
+            }
+            log.info("已发起级联推流: {}:{} → {}:{} ssrc={} con_type={}",
+                    useApp, stream, dstIp, dstPort,
+                    useSsrc == null ? "(源默认)" : useSsrc, conType);
+            return true;
+        } catch (Throwable t) {
+            log.warn("级联上行推流启动失败: {} {}", stream, t.toString());
+            return false;
+        }
     }
 
     /**
