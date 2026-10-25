@@ -78,6 +78,25 @@ public class RecordItem {
         return new RecordItem(deviceId, filePath, filePath, null, null, null, "manual", 0L);
     }
 
+    /**
+     * 以<b>时间区间</b>构造录像项（设备未提供 {@code <FilePath>} 时使用）。
+     *
+     * <p><b>为什么需要它</b>：标准 A.2.4.4 里 {@code FilePath} 是<b>可选</b>字段，
+     * 实测 LiveGBS 与大量国产设备根本不填 —— 它们按「时间段」管理录像，
+     * 回放时只认 {@code StartTime}/{@code EndTime}。
+     * 如果平台强依赖 FilePath，这些设备的录像列表能查到但点播不了，
+     * 表现为「有录像，点开报缺少 filePath」。
+     *
+     * @param deviceId  设备/通道编码
+     * @param startTime 录像段起始时间
+     * @param endTime   录像段结束时间
+     * @param name      录像名称（设备侧文件名，可能为空）
+     */
+    public static RecordItem ofRange(String deviceId, java.util.Date startTime,
+                                     java.util.Date endTime, String name) {
+        return new RecordItem(deviceId, name, null, null, startTime, endTime, "time", 0L);
+    }
+
     /** 从 {@code <Item>} 元素解析。 */
     static RecordItem from(Element item) {
         return new RecordItem(

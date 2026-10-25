@@ -9,6 +9,7 @@ import io.github.rurulalanana.gb28181.sip.event.RegisterEvent;
 import io.github.rurulalanana.gb28181.sip.event.SdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.SipCallback;
 import io.github.rurulalanana.gb28181.sip.cascade.CascadeEvents;
+import io.github.rurulalanana.gb28181.sip.manscdp.ManscdpMessage;
 import io.github.rurulalanana.gb28181.sip.sdp.SdpMessage;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -354,15 +355,35 @@ public class Gb28181MediaService implements SipCallback {
      */
     public RtpSession playback(String deviceId, String channelId, RecordItem item) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
+        /*
+         * 会话身份（mediaUri）：有 FilePath 用它，没有则用「起/止时间」。
+         *
+         * <p>不能用 null：大量设备（实测 LiveGBS、多数国产摄像机）不填
+         * FilePath，只按时间段管理录像。mediaUri 为 null 时：
+         *   1) 业务层拿不到任何区分信息，点不同时间段会复用同一个会话，
+         *      界面上「怎么点都是同一路画面」；
+         *   2) 回放 INVITE 的 u= 行为空，对端（部分平台）因此拒答。
+         *
+         * 标准 A.2.5.3 里 u= 的语义就是「录像文件路径或时间标识」，
+         * 填时间区间是合法的。
+         */
+        String mediaUri = item.getFilePath();
+        if (StringUtils.isBlank(mediaUri)) {
+            String start = RecordItem.formatTime(item.getStartTime());
+            String end = RecordItem.formatTime(item.getEndTime());
+            if (start != null) {
+                mediaUri = start + "/" + (end == null ? start : end);
+            }
+        }
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
-                MediaType.PLAYBACK, item.getFilePath());
+                MediaType.PLAYBACK, mediaUri);
         try {
             SdpMessage offer = buildPlaybackSdp(session, item);
             // 同实时点播：Request-URI / To / Subject 填通道编码
             String callId = client().invitePlayback(deviceId, channel, offer);
             sessionManager.bindCallId(session, callId);
-            log.info("已发起回放 INVITE: {} file={} callId={} playUrls={}",
-                    session, item.getFilePath(), callId, mediaServer.playUrls(session));
+            log.info("已发起回放 INVITE: {} mediaUri={} callId={} playUrls={}",
+                    session, mediaUri, callId, mediaServer.playUrls(session));
             return session;
         } catch (RuntimeException e) {
             // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
@@ -608,8 +629,172 @@ public class Gb28181MediaService implements SipCallback {
      */
     public void queryRecordInfo(String deviceId, String startTime, String endTime,
                                 Consumer<List<RecordItem>> onRecords) {
-        recordCallbacks.put(deviceId, new AtomicReference<>(onRecords));
-        client().queryRecordInfo(deviceId, startTime, endTime);
+        queryRecordInfo(deviceId, deviceId, startTime, endTime, onRecords);
+    }
+
+    /**
+     * 检索设备录像（标准 9.8 RecordInfo），异步回调。
+     *
+     * <p><b>回调按通道编码索引，不按设备编码</b>：设备应答里的
+     * {@code <DeviceID>} 是我们请求时写的<b>通道编码</b>（录像挂在通道上），
+     * 用设备编码做 key 会在应答到来时匹配不到，
+     * 表现为「设备明明回了录像列表，平台一直等到超时并报空」。
+     *
+     * @param sipTarget 设备编码（SIP 寻址用）
+     * @param channelId 通道编码（{@code <DeviceID>} 与回调 key）
+     * @param startTime ISO 8601 {@code yyyy-MM-dd'T'HH:mm:ss}
+     * @param endTime   同上
+     */
+    public void queryRecordInfo(String sipTarget, String channelId,
+                                String startTime, String endTime,
+                                Consumer<List<RecordItem>> onRecords) {
+        // 不能用 String.isBlank()：本模块锁 Java 8 API 级别（pom 里 <release>8</release>）
+        String key = channelId == null || channelId.trim().isEmpty() ? sipTarget : channelId;
+        recordCallbacks.put(key, new AtomicReference<>(onRecords));
+        recordPagers.put(key, new RecordPager(key));
+        client().queryRecordInfo(sipTarget, key, startTime, endTime);
+    }
+
+    /**
+     * 录像应答的分页聚合状态。
+     *
+     * <p><b>为什么必须聚合</b>：标准 9.8 的 RecordInfo 应答支持分页 ——
+     * {@code <SumNum>} 是总段数，而 {@code <RecordList Num="...">} 只携带其中一页。
+     * 实测 LiveGBS v250103 严格按标准执行：一个通道有 13 段录像时，它连发
+     * <b>13 个独立的 Response</b>，每帧 {@code SumNum=13} 但只含 1 个 {@code <Item>}。
+     *
+     * <p>改造前收到第一帧就 {@code remove} 掉回调并返回，于是界面上永远只显示
+     * 1 段录像 —— 用户看到「只有一段」会以为设备录像缺失，实际是我们的聚合缺失。
+     *
+     * <p><b>收口条件</b>：已收条数 &ge; {@code SumNum}（正常收齐），
+     * 或距最后一帧超过 {@link #RECORD_IDLE_MS}（设备少报/丢包，不能无限等）。
+     */
+    private static final class RecordPager {
+
+        /** 无新帧多久判定收口（毫秒）。 */
+        static final long IDLE_MS = 1200L;
+
+        private final String key;
+        private final java.util.List<RecordItem> items = new java.util.ArrayList<>();
+        private final Map<String, RecordItem> unique = new java.util.LinkedHashMap<>();
+        private volatile int sumNum;
+        private volatile long lastFrameAt = System.currentTimeMillis();
+        private volatile boolean done;
+
+        RecordPager(String key) {
+            this.key = key;
+        }
+
+        /**
+         * 累积一帧。
+         *
+         * @return {@code true} 表示已收齐，可以回调业务方
+         */
+        synchronized boolean accept(ManscdpMessage msg, List<RecordItem> frame) {
+            lastFrameAt = System.currentTimeMillis();
+            Integer declared = msg == null ? null : msg.intOf("SumNum");
+            if (declared != null && declared > 0) {
+                sumNum = declared;
+            }
+            for (RecordItem item : frame) {
+                /*
+                 * 按「起始时间 + 结束时间 + 名称」去重：
+                 * 部分设备在重传时会重复上报同一段，
+                 * 不去重会让界面上出现一模一样的两行。
+                 */
+                String id = item.getStartTime() + "|" + item.getEndTime()
+                        + "|" + item.getName();
+                unique.put(id, item);
+            }
+            if (sumNum > 0 && unique.size() >= sumNum) {
+                done = true;
+                return true;
+            }
+            return false;
+        }
+
+        /** 空闲超时兜底：设备少报或丢包时，把已收到的交上去。 */
+        boolean expireIfIdle() {
+            if (done) {
+                return false;
+            }
+            if (System.currentTimeMillis() - lastFrameAt < IDLE_MS) {
+                return false;
+            }
+            done = true;
+            return !unique.isEmpty();
+        }
+
+        List<RecordItem> snapshot() {
+            return new java.util.ArrayList<>(unique.values());
+        }
+
+        @Override
+        public String toString() {
+            return "RecordPager{" + key + ", 已收 " + unique.size()
+                    + "/" + (sumNum > 0 ? sumNum : "?") + "}";
+        }
+    }
+
+    /** 正在聚合的录像应答，key = 通道编码。 */
+    private final Map<String, RecordPager> recordPagers = new ConcurrentHashMap<>();
+
+    /**
+     * 检查所有空闲超时的录像聚合批次并收口。
+     *
+     * <p>由 {@link #onManscdpResponse} 在每帧之后顺带触发，<b>不另起线程</b>：
+     * 录像查询不是热路径，为它常驻一个调度线程不值得。
+     * 代价是「设备只回了一帧不完整的应答」时要等下一次任意 MANSCDP 应答才收口 ——
+     * 而这种情况业务侧的 {@code future.get(timeout)} 本来就会先超时，
+     * 不会让用户多等。
+     */
+    private void expireIdleRecordPagers() {
+        for (Map.Entry<String, RecordPager> e : recordPagers.entrySet()) {
+            RecordPager pager = e.getValue();
+            if (!pager.expireIfIdle()) {
+                continue;
+            }
+            if (recordPagers.remove(e.getKey(), pager)) {
+                completeRecordQuery(e.getKey(), pager);
+            }
+        }
+    }
+
+    /** 回调业务方并清理状态。 */
+    private void completeRecordQuery(String key, RecordPager pager) {
+        AtomicReference<Consumer<List<RecordItem>>> ref = recordCallbacks.remove(key);
+        List<RecordItem> merged = pager.snapshot();
+        log.info("录像检索聚合完成: channel={} 段数={} {}", key, merged.size(), pager);
+        if (ref != null && ref.get() != null) {
+            ref.get().accept(merged);
+        }
+    }
+
+    /**
+     * 取走某通道尚未收口的录像聚合结果（并把回调置空）。
+     *
+     * <p>用途：设备少报了 {@code SumNum}、或分页帧中途丢包时，
+     * 聚合永远等不到「收齐」条件。业务侧{@code future.get(timeout)} 超时后
+     * 调用本方法，可以拿到<b>已经收到的那些</b>，而不是整体丢弃——
+     * 对用户来说「看到 5 段」远好于「一段都没有」。
+     *
+     * @return 已聚合的录像段；没有在处理中的批次时返回空列表
+     */
+    public List<RecordItem> takePendingRecords(String channelId) {
+        if (channelId == null) {
+            return java.util.Collections.emptyList();
+        }
+        RecordPager pager = recordPagers.remove(channelId);
+        recordCallbacks.remove(channelId);
+        if (pager == null) {
+            return java.util.Collections.emptyList();
+        }
+        List<RecordItem> items = pager.snapshot();
+        if (!items.isEmpty()) {
+            log.warn("录像检索未收齐即取走: channel={} 已收 {} 段 {}",
+                    channelId, items.size(), pager);
+        }
+        return items;
     }
 
     @Override
@@ -617,13 +802,24 @@ public class Gb28181MediaService implements SipCallback {
         if (event == null || event.getManscdp() == null) {
             return;
         }
-        String deviceId = event.getManscdp().getDeviceId();
-        AtomicReference<Consumer<List<RecordItem>>> ref =
-                deviceId == null ? null : recordCallbacks.remove(deviceId);
-        if (ref != null && ref.get() != null) {
-            List<RecordItem> items = RecordItem.parse(event);
-            log.info("收到录像检索结果: device={} items={}", deviceId, items.size());
-            ref.get().accept(items);
+        ManscdpMessage msg = event.getManscdp();
+        String deviceId = msg.getDeviceId();
+        /*
+         * 录像检索应答：必须累积所有分页帧后再回调。
+         * 见 {@link RecordPager} 的说明 —— 设备按标准一帧一页上报，
+         * 收到第一帧就回调只会拿到 1 段录像。
+         */
+        if ("RecordInfo".equals(msg.getCmdType()) && deviceId != null) {
+            RecordPager pager = recordPagers.get(deviceId);
+            if (pager != null) {
+                List<RecordItem> frame = RecordItem.parse(event);
+                if (pager.accept(msg, frame)
+                        && recordPagers.remove(deviceId, pager)) {
+                    completeRecordQuery(deviceId, pager);
+                }
+            }
+            // 顺带收口其它空闲批次（设备少报/丢包时的兜底）
+            expireIdleRecordPagers();
         }
         SipCallback delegate = callbackDelegate;
         if (delegate != null) {
@@ -936,7 +1132,10 @@ public class Gb28181MediaService implements SipCallback {
         SdpMessage sdp = new SdpMessage()
                 .origin(props.getPlatformId(), props.getMediaIp())
                 .sessionName(SdpMessage.S_PLAYBACK)
-                .uri(item.getFilePath())
+                // u= 用会话身份（FilePath，或退化为「起/止时间」）：
+                // 空 u= 会让部分平台无法定位录像而直接不应答
+                .uri(session.getMediaUri() != null
+                        ? session.getMediaUri() : item.getFilePath())
                 .connection(props.getMediaIp())
                 .mediaPort(session.getPort())
                 .mediaProto(SdpMessage.PROTO_UDP)
