@@ -776,8 +776,18 @@ public class Gb28181MediaService implements SipCallback {
                     .rtpmap("96", "PS")
                     .ssrc(event.getSsrc());
             client().respondInvite(event.getRawRequestEvent(), answer);
-            log.info("级联上行点播已应答: 上级={} 通道={} → 推流目标 {}:{}",
-                    platformId, channelId, dstIp, dstPort);
+            /*
+             * 传输方式必须跟上级 SDP 走。
+             *
+             * 标准 9.2 用 m= 的协议字段区分承载：RTP/AVP 是 UDP，TCP/RTP/AVP 是 TCP；
+             * a=setup:passive 表示对端被动监听、需要我们主动连过去，a=setup:active
+             * 则相反。公网级联里上级经常只肯收 TCP（NAT 下 UDP 双向不通），
+             * 此时仍按 UDP 推会一个包都到不了对端，上级就在超时后报
+             * 「none rtp data receive」。
+             */
+            boolean tcp = isTcpMedia(event.getSdp());
+            log.info("级联上行点播已应答: 上级={} 通道={} → 推流目标 {}:{} 传输={}",
+                    platformId, channelId, dstIp, dstPort, tcp ? "TCP主动" : "UDP主动");
             // 交给业务方：启动本地流，并调用 ZlmMediaServer#startSendRtpToSource
             SipCallback delegate = callbackDelegate;
             if (delegate == null) {
@@ -792,6 +802,7 @@ public class Gb28181MediaService implements SipCallback {
                     .dstPort(dstPort)
                     .ssrc(event.getSsrc())
                     .callId(event.getCallId())
+                    .tcp(tcp)
                     .build());
         } catch (Exception e) {
             log.error("级联上行点播处理失败: channel={}", channelId, e);
@@ -799,9 +810,32 @@ public class Gb28181MediaService implements SipCallback {
         }
     }
 
+    /**
+     * 判断上级 SDP 是否要求用 TCP 承载 RTP。
+     *
+     * <p>规则（标准 9.2 与附录 G）：
+     * <ul>
+     *   <li>{@code m=video <port> TCP/RTP/AVP ...} → TCP；否则 UDP</li>
+     *   <li>{@code a=setup:active} 表示<b>对端主动连我们</b>，即我们需要被动监听
+     *       —— 当前推流实现只支持「我们主动连过去」，遇到这种情况按 TCP 主动处理
+     *       会连不上，所以退回 UDP 更不容易出错；只有 {@code passive}（或未声明，
+     *       国标惯例默认上级被动）才真正走 TCP 主动</li>
+     * </ul>
+     */
+    private static boolean isTcpMedia(io.github.rurulalanana.gb28181.sip.sdp.SdpMessage sdp) {
+        if (sdp == null || sdp.getMediaProto() == null) {
+            return false;
+        }
+        if (!sdp.getMediaProto().toUpperCase(java.util.Locale.ROOT).contains("TCP")) {
+            return false;
+        }
+        String setup = sdp.getSetup();
+        // a=setup:active：对端要求它自己主动连，我们做被动端，当前不支持
+        return setup == null || !"active".equalsIgnoreCase(setup.trim());
+    }
+
     /** 语音广播 INVITE（设备按标准发起）。 */
-    private void handleBroadcastInvite(InviteEvent event) {
-        BroadcastService broadcast = broadcastService;
+    private void handleBroadcastInvite(InviteEvent event) {        BroadcastService broadcast = broadcastService;
         String deviceId = event.getPeer() == null ? null : event.getPeer().getDeviceId();
         if (broadcast == null || deviceId == null) {
             reject(event, SDP_NOT_ACCEPTABLE);
