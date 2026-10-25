@@ -106,6 +106,22 @@ public class MediaServerProperties {
     @Builder.Default
     private final io.github.rurulalanana.gb28181.sip.security.AccessControl accessControl = null;
 
+    /**
+     * 「这个对端是不是我的上级平台」的判定器（级联上行点播用）。
+     *
+     * <p><b>为什么必须由业务方注入</b>：上级平台的地址只存在于应用配置里
+     * （{@code gb_cascade.parent_id}），媒体模块拿不到数据库。
+     * 不注入时返回 {@code null}，行为与本功能不存在时完全一致。
+     *
+     * <p><b>为什么不能复用下行注册表判断</b>：那个注册表里装的是「谁注册到了我」——
+     * 上级永远是<b>我们注册出去</b>的，永远不会出现在里面。用错注册表会让
+     * 上行点播 INVITE 落到「设备 INVITE」分支：开一个<b>接收</b>会话、回 200 OK，
+     * 然后等设备推流 —— 而实际需要的是我们<b>推</b>给上级，
+     * 结果是上级等 20 秒后报「none rtp data」，我们这边日志一片正常。
+     */
+    @Builder.Default
+    private final java.util.function.Predicate<String> uplinkPlatformChecker = null;
+
     /** HTTP 服务端口（HTTP-FLV / HLS / WebRTC 信令 / HTTP API）。0 = 自动选空闲端口。 */
     @Builder.Default
     private final int httpPort = 8080;

@@ -8,6 +8,7 @@ import io.github.rurulalanana.gb28181.sip.event.ManscdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.RegisterEvent;
 import io.github.rurulalanana.gb28181.sip.event.SdpEvent;
 import io.github.rurulalanana.gb28181.sip.event.SipCallback;
+import io.github.rurulalanana.gb28181.sip.cascade.CascadeEvents;
 import io.github.rurulalanana.gb28181.sip.sdp.SdpMessage;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -136,6 +137,21 @@ public class Gb28181MediaService implements SipCallback {
             return;
         }
         String peerId = event.getPeer() == null ? null : event.getPeer().getDeviceId();
+
+        /*
+         * 级联上行：上级平台点播本级自有通道。
+         *
+         * <p><b>必须单独判断</b>：判断「是不是级联」不能只看下行注册表 ——
+         * 上级永远不注册到本级，所以 registry 里查不到它。改造前这种 INVITE
+         * 会落到下面的「设备 INVITE」分支：开一个<b>接收</b>会话、回 200 OK，
+         * 然后等设备推流给我们 —— 而实际上需要的是我们<b>推</b>流给上级。
+         * 结果是上级等 20 秒后报「none rtp data」，而我们这边日志一片正常。
+         */
+        if (peerId != null && props.getUplinkPlatformChecker() != null
+                && props.getUplinkPlatformChecker().test(peerId)) {
+            handleUplinkInvite(event, peerId);
+            return;
+        }
 
         // 级联点播：来自已登记的级联平台，转发媒体而非自己收流
         if (peerId != null && sipServer != null && sipServer.getCascade() != null
@@ -716,6 +732,69 @@ public class Gb28181MediaService implements SipCallback {
                     platformId, dstIp, dstPort, ctx.localPort);
         } catch (Exception e) {
             log.error("级联点播处理失败: platform={}", platformId, e);
+            reject(event, SDP_NOT_ACCEPTABLE);
+        }
+    }
+
+    /**
+     * 级联上行点播：上级点播本级自有通道。
+     *
+     * <p>媒体层只做两件事：<b>应答 200 OK（带 SDP）</b>，
+     * 然后<b>把「该往哪推流」告诉业务方</b>。
+     * 为什么不在这一层直接推：推流的前提是本地流已经在跑，而
+     * 「哪台设备、怎么让它推流」属于业务层知识（本模块拿不到设备表）。
+     */
+    private void handleUplinkInvite(InviteEvent event, String platformId) {
+        String channelId = resolveChannelId(event);
+        if (channelId == null || channelId.trim().isEmpty()) {
+            log.warn("级联上行 INVITE 无法解析通道编码: callId={}", event.getCallId());
+            reject(event, 400);
+            return;
+        }
+        String dstIp = event.getSdp().resolveMediaIp();
+        int dstPort = event.getMediaPort();
+        if (dstIp == null || dstIp.trim().isEmpty() || dstPort <= 0) {
+            // 没有收流地址就无法推流。与其回 200 OK 让上级干等 20 秒后报
+            // 「none rtp data」，不如立刻拒绝 —— 错误在两边都看得见。
+            log.warn("级联上行 INVITE 缺少有效收流地址: channel={} dstIp={} dstPort={}",
+                    channelId, dstIp, dstPort);
+            reject(event, SDP_NOT_ACCEPTABLE);
+            return;
+        }
+        try {
+            /*
+             * 应答 SDP 声明本级媒体地址。上级其实从它自己的 INVITE 里就知道
+             * 该在哪收流，这里主要是让它的解析器能正常建立会话。
+             */
+            SdpMessage answer = new SdpMessage()
+                    .origin(props.getPlatformId(), props.getMediaIp())
+                    .sessionName(SdpMessage.S_PLAY)
+                    .connection(props.getMediaIp())
+                    .realtime()
+                    .mediaPort(props.getHttpPort())
+                    .payloadType("96")
+                    .rtpmap("96", "PS")
+                    .ssrc(event.getSsrc());
+            client().respondInvite(event.getRawRequestEvent(), answer);
+            log.info("级联上行点播已应答: 上级={} 通道={} → 推流目标 {}:{}",
+                    platformId, channelId, dstIp, dstPort);
+            // 交给业务方：启动本地流，并调用 ZlmMediaServer#startSendRtpToSource
+            SipCallback delegate = callbackDelegate;
+            if (delegate == null) {
+                // 业务方未挂载：没有它就无法启动流与推流，直接挂断比让上级干等更好
+                log.warn("未挂载业务回调，无法完成级联上行推流: channel={}", channelId);
+                return;
+            }
+            delegate.onUplinkCascadePlay(CascadeEvents.UplinkPlay.builder()
+                    .platformId(platformId)
+                    .channelId(channelId)
+                    .dstIp(dstIp)
+                    .dstPort(dstPort)
+                    .ssrc(event.getSsrc())
+                    .callId(event.getCallId())
+                    .build());
+        } catch (Exception e) {
+            log.error("级联上行点播处理失败: channel={}", channelId, e);
             reject(event, SDP_NOT_ACCEPTABLE);
         }
     }
