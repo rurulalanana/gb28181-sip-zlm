@@ -1336,6 +1336,21 @@ public class Gb28181MediaService implements SipCallback {
         }
         SdpMessage sdp = new SdpMessage()
                 .origin(props.getPlatformId(), props.getMediaIp())
+                /*
+                 * 即使带倍速，会话类型仍用 s=Playback。
+                 *
+                 * <p><b>为什么不改成 s=Download</b>：实测过一次，收益为零、
+                 * 副作用明确：
+                 * <ul>
+                 *   <li>速率没变 —— 录到的仍是 59 KB/s（约 1 倍速），
+                 *       说明设备忽略 {@code a=downloadspeed} 与会话类型无关；</li>
+                 *   <li>设备在 200 OK 里回 {@code t=0 0} +
+                 *       {@code a=filesize:1050811420}，即<b>它打算推整个录像文件</b>，
+                 *       而不是我们 {@code t=} 请求的那段时间。于是「下载
+                 *       23:10~23:13」拿到的会是文件开头的内容，时间点完全错位。</li>
+                 * </ul>
+                 * 内容正确优先于「形式上更标准」，所以保持 Playback。
+                 */
                 .sessionName(SdpMessage.S_PLAYBACK)
                 .uri(uri)
                 .connection(props.getMediaIp())
