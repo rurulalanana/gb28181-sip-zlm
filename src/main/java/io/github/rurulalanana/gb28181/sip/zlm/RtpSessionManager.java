@@ -13,6 +13,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -95,7 +96,40 @@ public class RtpSessionManager {
      * 先记在这里，等会话登记时补一次上线。键为 {@code <设备编码>/<通道编码>}。
      */
     private final Map<String, Boolean> pendingOnline = new ConcurrentHashMap<>();
-    private final AtomicInteger ssrcSeq = new AtomicInteger(1);
+
+    /** 域内流标识（SSRC 后 4 位）的取值范围，GB/T 28181 附录 G 规定 0000~9999。 */
+    private static final int SSRC_SEQ_MIN = 1;
+    private static final int SSRC_SEQ_MAX = 9999;
+
+    /**
+     * 域内流标识的自增游标。
+     *
+     * <p><b>起点必须随机，不能固定从 1 开始</b>。这是「重启后第一次直播丢包、
+     * 等于播不出画面」的根因：
+     *
+     * <ol>
+     *   <li>服务重启时<b>设备并没有停推</b> —— 我方 JVM 被强制杀掉（
+     *       原生库析构卡住，优雅停止必然超时），根本来不及发 BYE。
+     *       设备继续往固定的单端口推旧 SSRC 的 RTP。</li>
+     *   <li>旧进程退出到新进程重新监听这段时间，内核计数里的
+     *       {@code Udp: NoPorts} 会持续增长 —— 那就是设备的包在砸已关闭的端口。</li>
+     *   <li>新进程一监听，这些残留包立刻被 ZLM 以 SSRC 十六进制名
+     *       （{@code rtp/0BEBC201}）自动建成媒体源。</li>
+     *   <li>游标固定从 1 开始的话，重启后第一路点播拿到的 SSRC
+     *       <b>与重启前一模一样</b>。旧流还在推、新流也进来了，两路
+     *       <b>同一个 SSRC 但序列号/时间戳各成一套</b>，ZLM 单端口只能
+     *       按 SSRC 分流，两路被合并进同一个 RtpProcess —— 序列号来回倒退，
+     *       就是日志里刷屏的 {@code packet dropped} 与 {@code rtp丢包}，
+     *       PS 帧永远拼不起来，画面全黑。</li>
+     *   <li>关掉重播为什么就好了：第二路拿到的是下一个编号，与残留流的
+     *       SSRC 不同，各走各的 RtpProcess，互不干扰。</li>
+     * </ol>
+     *
+     * <p>随机起点把「重启前后编号必定相同」变成「几乎不可能相同」，
+     * 从根上避免两路流合流。SSRC 只需<b>域内当时唯一</b>，不需要跨重启稳定。
+     */
+    private final AtomicInteger ssrcSeq =
+            new AtomicInteger(ThreadLocalRandom.current().nextInt(SSRC_SEQ_MIN, SSRC_SEQ_MAX + 1));
     /** 固定端口范围的轮询游标。 */
     private final AtomicInteger nextPort = new AtomicInteger(0);
 
@@ -385,8 +419,10 @@ public class RtpSessionManager {
         // SSRC 首位：实时 0 / 历史 1（GB/T 28181 附录 G）；buildSsrc 第三个参数是 realtime
         // 后 4 位：自动模式用域内自增序号；指定码流编号时用该编号
         //（GB/T 28181—2022：后 4 位即码流编号，0 主码流 / 1 子码流）
-        int streamSeq = streamNumber >= 0 ? streamNumber : ssrcSeq.getAndIncrement();
-        String ssrc = GbId.buildSsrc(channel, streamSeq, !mediaType.historical());
+        boolean ssrcRealtime = !mediaType.historical();
+        String ssrc = streamNumber >= 0
+                ? GbId.buildSsrc(channel, streamNumber, ssrcRealtime)
+                : nextFreeSsrc(channel, ssrcRealtime);
         String ssrcFilter = normalizeSsrc(deviceSsrc);
 
         boolean singlePort = mediaServer.isSinglePortMode();
@@ -399,6 +435,23 @@ public class RtpSessionManager {
             // 会话登记后由推流回调按 SSRC 反查并改名（见 ZlmMediaServer#buildEvents）。
             handle = null;
             actualPort = mediaServer.getSinglePort();
+            /*
+             * 清掉占着本次 SSRC 的残留媒体源。
+             *
+             * <p>理论上上面的随机游标已经让撞号变得极罕见，但 SSRC 只有
+             * 1~9999 个可用值，撞一次就是「永远黑屏」，代价不对等，所以再
+             * 兜一道。判据很硬：<b>这台机器上还没有任何会话领走这个 SSRC</b>
+             * （会话刚 open，尚未登记），此时 ZLM 里却已存在同名媒体源，
+             * 那它只可能是重启前设备残留推流自动建出来的，关掉不影响任何人。
+             */
+            String ssrcName = ssrcHexName(ssrc);
+            if (ssrcName != null) {
+                int staleSsrc = mediaServer.closeMediaSource(SINGLE_PORT_APP, ssrcName);
+                if (staleSsrc > 0) {
+                    log.info("清理占用 SSRC {} 的残留媒体源 {} 个: key={}",
+                            ssrcName, staleSsrc, sessionKey);
+                }
+            }
         } else {
             int port = allocatePort();
             // 参数序：mk_rtp_server_create2(port, tcp_mode, vhost, app, stream_id)
@@ -626,6 +679,71 @@ public class RtpSessionManager {
         }
         // 同步墓碑：设备不认 BYE 时会话虽拆，SSRC 仍被沿用，靠它重新认领
         rememberSsrc(key, session);
+    }
+
+    /**
+     * 取下一个域内流标识（1~9999），用完回绕。
+     *
+     * <p><b>必须回绕</b>：{@code GbId.buildSsrc} 只接受 0~9999，直接
+     * {@code getAndIncrement()} 的话，一个长跑进程累计点播 9999 次之后
+     * 每一路都会抛 {@code IllegalArgumentException} —— 表现是「跑久了以后
+     * 所有点播都失败」，而且重启才能恢复，极难定位。
+     */
+    private int nextSsrcSeq() {
+        for (; ; ) {
+            int cur = ssrcSeq.get();
+            int next = cur >= SSRC_SEQ_MAX ? SSRC_SEQ_MIN : cur + 1;
+            if (ssrcSeq.compareAndSet(cur, next)) {
+                return cur;
+            }
+        }
+    }
+
+    /**
+     * 取一个<b>当前未被占用</b>的 SSRC。
+     *
+     * <p>为什么不能只靠 {@link #nextSsrcSeq()}：可用编号只有
+     * {@code 0000~9999} 这 10000 个（GB/T 28181 附录 G 的是 10 位定长十进制，
+     * 后 4 位就是全部可用空间），用完必然回绕。回绕后若撞上
+     * <b>仍在推流</b>的旧会话，单端口模式下 ZLM 按 SSRC 分流，两路会被
+     * 合并进同一个 {@code RtpProcess} —— 序列号/时间戳相互倒退，
+     * 表现就是刷屏的 {@code packet dropped}、画面全黑。
+     *
+     * <p>所以回绕只是「换一个编号再试」，必须拿 {@link #bySsrc} 排掉
+     * 在用的编号。一万次循环只发生在「编号几乎全满」的极端场景，
+     * 而那时业务早已不可用，日志里也一定能看到。
+     *
+     * <p><b>实时与历史互不干扰</b>：两者首位不同（0 / 1），
+     * 算出的是不同的数值键，同一序号可以被直播与回放同时占用。
+     *
+     * @param channel  通道编码（用于推导域标识）
+     * @param realtime 实时（首位 0）还是历史（首位 1）
+     */
+    private String nextFreeSsrc(String channel, boolean realtime) {
+        for (int i = 0; i < SSRC_SEQ_MAX; i++) {
+            String candidate = GbId.buildSsrc(channel, nextSsrcSeq(), realtime);
+            Long key = parseSsrc(candidate);
+            if (key == null || !bySsrc.containsKey(key)) {
+                return candidate;
+            }
+        }
+        // 10000 个编号全被占满：只能硬给一个，让上层按「SSRC 冲突」暴露出来
+        log.warn("SSRC 编号已全部被占用（{} 个），回退到直接分配", SSRC_SEQ_MAX);
+        return GbId.buildSsrc(channel, nextSsrcSeq(), realtime);
+    }
+
+    /**
+     * 把平台 SSRC（十进制串）转成 ZLM 单端口模式下的流名。
+     *
+     * <p>ZLM 用 {@code printSSRC} 把 RTP 头里的 {@code uint32} SSRC 打成
+     * <b>8 位大写十六进制</b>（{@code 0200000001} → {@code 0BEBC201}），
+     * 与 {@link #resolveBySsrcName} 的解析方向相反。
+     *
+     * @return 无法解析时返回 {@code null}
+     */
+    private static String ssrcHexName(String ssrc) {
+        Long value = parseSsrc(ssrc);
+        return value == null ? null : String.format("%08X", value);
     }
 
     /**

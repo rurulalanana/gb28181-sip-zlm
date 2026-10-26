@@ -6,7 +6,7 @@
 
   <groupId>io.github.rurulalanana</groupId>
   <artifactId>gb28181-sip-zlm</artifactId>
-  <version>1.0.9</version>
+  <version>1.0.10</version>
   <packaging>jar</packaging>
 
   <name>gb28181-sip-zlm</name>
@@ -44,7 +44,7 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
-    <sip.module.version>1.0.13</sip.module.version>
+    <sip.module.version>1.0.14</sip.module.version>
     <!--
       1.13.0 而非 1.12.0：内嵌的 ZLM 内核从 ac64e33(2026-07-24) 换到
       1026839(2026-09-22)，差两个月。

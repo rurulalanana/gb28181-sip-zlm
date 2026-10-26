@@ -196,6 +196,27 @@ public class MediaServerProperties {
     @Builder.Default
     private final int rtpSinglePortNumber = 24560;
 
+    /**
+     * {@code [rtp_proxy] udp_recv_socket_buffer}：RTP 收流 socket 的接收缓冲（字节）。
+     *
+     * <p><b>为什么必须显式放大</b>：国标摄像机的编码器不会平滑发送 —— 收到 INVITE 后
+     * 它会把攒着的码流<b>一次性倾出</b>（实测首秒包量约为稳态的 2.4 倍）。默认缓冲
+     * 只有几百 KB，一波突发就溢出，内核直接丢包（{@code /proc/net/snmp} 里
+     * {@code Udp: RcvbufErrors} 会持续增长）。
+     *
+     * <p><b>丢的往往是开头的包 —— 而那正是 SPS/PPS + 首个 I 帧</b>。ZLM 等齐 track 的
+     * 时间一到（{@code All track ready use ≈11s}）会把没就绪的视频轨直接丢弃：
+     * {@code Track not ready for a long time, ignored: H264}。这个决定是<b>一次性的</b>，
+     * 媒体源从此只是纯音频，浏览器永远是黑屏 —— 用户看到的就是「第一次播放不出画面，
+     * 关掉重播才行」。
+     *
+     * <p><b>光调这里不够</b>：Linux 会把 {@code SO_RCVBUF} 夹到
+     * {@code net.core.rmem_max}。宿主机默认往往只有 208KB，所以必须同时调大：
+     * <pre>sysctl -w net.core.rmem_max=16777216</pre>
+     */
+    @Builder.Default
+    private final int udpRecvSocketBuffer = 8 * 1024 * 1024;
+
     /** ZLM 虚拟主机名（默认虚拟主机）。 */
     @Builder.Default
     private final String vhost = "__defaultVhost__";
@@ -243,8 +264,14 @@ public class MediaServerProperties {
     /**
      * HLS 切片与 HTTP 静态根目录。
      *
-     * <p>对应 {@code [hls] hls_save_path} 与 {@code [http] rootPath}。
+     * <p>对应 {@code [protocol] hls_save_path} 与 {@code [http] rootPath}。
      * 两者必须是同一目录，否则切片生成了浏览器也访问不到。
+     *
+     * <p><b>默认值用相对路径 {@code ./www} 而不是绝对路径</b>：ZLM 把相对
+     * 路径解析为「<b>可执行文件所在目录</b>」下的子目录。宿主是 JVM（zlm4j），
+     * “可执行文件”就是 {@code java} 本身，于是一个写成
+     * {@code System.getProperty("user.dir") + "/www"} 的绝对路径反而更安全：
+     * 它不依赖 java 二进制装在哪里。保留绝对路径。
      */
     @Builder.Default
     private final String hlsSavePath = System.getProperty("user.dir") + "/www";

@@ -42,6 +42,23 @@ public class Gb28181MediaService implements SipCallback {
     /** 标准拒绝码：SDP 无法满足（附录 G 注 17）。 */
     private static final int SDP_NOT_ACCEPTABLE = 488;
 
+    /** 同一个来源的同类拒绝日志最小间隔（毫秒）：扫描器约 30 次/小时，5 分钟折叠一次足够。 */
+    private static final long REJECT_LOG_INTERVAL_MS = 5 * 60 * 1000L;
+
+    /** 拒绝日志的上次打印时间（key = 来源 IP + 原因）。 */
+    private final java.util.Map<String, Long> lastRejectLogAt = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 拒绝日志的折叠计数（key 同上）。 */
+    private final java.util.Map<String, Integer> lastRejectLogCount = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 「不限速」倍速取值。
+     *
+     * <p>1 表示设备按实时速度推流，也就是改造前的行为。
+     * 取该值时不写 {@code a=downloadspeed}，报文与历史版本完全一致。
+     */
+    private static final int SPEED_UNLIMITED = 1;
+
     private final ZlmMediaServer mediaServer;
     private final RtpSessionManager sessionManager;
     private final MediaServerProperties props;
@@ -167,10 +184,37 @@ public class Gb28181MediaService implements SipCallback {
             return;
         }
 
+        /*
+         * 未注册的对端一律拒绝（403 Forbidden）。
+         *
+         * <h3>为什么必须先于「s=Play 才应答」这一步</h3>
+         * GB/T 28181 要求先 REGISTER 再 INVITE，但我们原来<b>没有校验
+         * 注册状态</b>：只要 SDP 写 {@code s=Play}，就拿 From 当作设备编码
+         * 建一个收流会话并回 200 OK。后果很具体：
+         * <ul>
+         *   <li><b>公网扫描器</b>能凭空创建会话。本机实测 24 小时内从
+         *       {@code 37.49.228.147} 收到 615 次随机 Call-ID 的探测；
+         *       其中一次写了 {@code s=Play}，日志里留下了
+         *       {@code 已应答 INVITE(200 OK)} 紧跟 {@code 发送 BYE 失败：设备未注册}；</li>
+         *   <li>每接受一次就占一个会话（独占端口模式下还占一个 RTP 端口），
+         *       足够多的请求可以把端口池吃光，真实设备反而点播不了；</li>
+         *   <li>对扫描器回 200 OK 等于确认「这里有个活的 SIP 服务」，
+         *       会被反复回访。</li>
+         * </ul>
+         *
+         * <p><b>顺序很重要</b>：上级平台不注册到本级，所以必须在
+         * {@code uplinkPlatformChecker} 与级联注册表判定<b>之后</b>才查设备注册表，
+         * 否则会把上级的正常点播一并拒掉（那才是真正会打断业务的方向）。
+         */
+        if (peerId == null || !isRegisteredDevice(peerId)) {
+            logRejectThrottled(peerId, event, "对端未注册");
+            reject(event, 403);
+            return;
+        }
+
         MediaType type = MediaType.ofSessionName(event.getSdp().getSessionName());
         if (type == MediaType.REALTIME && !event.isPlay()) {
-            log.warn("暂不支持的 INVITE 类型: s={} callId={}",
-                    event.getSdp().getSessionName(), event.getCallId());
+            logRejectThrottled(peerId, event, "SDP s= 不是 Play");
             reject(event, SDP_NOT_ACCEPTABLE);
             return;
         }
@@ -354,6 +398,24 @@ public class Gb28181MediaService implements SipCallback {
      * @param item      {@link #queryRecordInfo} 检索到的录像段
      */
     public RtpSession playback(String deviceId, String channelId, RecordItem item) {
+        return playback(deviceId, channelId, item, SPEED_UNLIMITED);
+    }
+
+    /**
+     * 平台主动历史回放，可指定下载倍速。
+     *
+     * <p><b>为什么回放也支持倍速</b>：标准 9.9 的文件下载（{@code s=Download}）
+     * 设备支持度很差（多数国产摄像机直接 4xx），本平台的「下载」因此复用
+     * 回放链路 + 本地录制。而 9.9.1 b) 规定倍速是由<b>请求方在 SDP 中携带</b>的
+     * （{@code a=downloadspeed:N}），设备侧只按这个属性决定推流速率，
+     * 与 {@code s=} 是 Playback 还是 Download 无关。所以下载时在回放 SDP 里
+     * 带上倍速，就能让设备快进推流，而不必依赖 {@code s=Download}。
+     *
+     * @param downloadSpeed 倍速档位（设备 {@code Info/DownloadSpeed} 声明的值，
+     *                      如 2/4/8）；{@code 1} 表示按实时速度推流
+     */
+    public RtpSession playback(String deviceId, String channelId, RecordItem item,
+                               int downloadSpeed) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         /*
          * 会话身份（mediaUri）：有 FilePath 用它，没有则用「起/止时间」。
@@ -378,12 +440,12 @@ public class Gb28181MediaService implements SipCallback {
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.PLAYBACK, mediaUri);
         try {
-            SdpMessage offer = buildPlaybackSdp(session, item);
+            SdpMessage offer = buildPlaybackSdp(session, item, downloadSpeed);
             // 同实时点播：Request-URI / To / Subject 填通道编码
             String callId = client().invitePlayback(deviceId, channel, offer);
             sessionManager.bindCallId(session, callId);
-            log.info("已发起回放 INVITE: {} mediaUri={} callId={} playUrls={}",
-                    session, mediaUri, callId, mediaServer.playUrls(session));
+            log.info("已发起回放 INVITE: {} mediaUri={} 倍速={} callId={} playUrls={}",
+                    session, mediaUri, downloadSpeed, callId, mediaServer.playUrls(session));
             return session;
         } catch (RuntimeException e) {
             // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
@@ -414,19 +476,29 @@ public class Gb28181MediaService implements SipCallback {
      * @param item      要下载的录像段（含时间区间；有 FilePath 时用路径）
      */
     public RtpSession download(String deviceId, String channelId, RecordItem item) {
+        return download(deviceId, channelId, item, SPEED_UNLIMITED);
+    }
+
+    /**
+     * 平台主动文件下载，可指定下载倍速（标准 9.9.1 b)）。
+     *
+     * @param downloadSpeed 倍速档位；{@code 1} 表示按实时速度推流
+     */
+    public RtpSession download(String deviceId, String channelId, RecordItem item,
+                               int downloadSpeed) {
         String channel = StringUtils.isBlank(channelId) ? deviceId : channelId;
         String mediaUri = recordIdentity(item);
         RtpSession session = sessionManager.open(channel, deviceId, null, 0, null,
                 MediaType.DOWNLOAD, mediaUri);
         try {
-            SdpMessage offer = buildPlaybackSdp(session, item)
+            SdpMessage offer = buildPlaybackSdp(session, item, downloadSpeed)
                     .sessionName(SdpMessage.S_DOWNLOAD);
             // Subject 传 null：由 sip 模块按标准生成
             // <通道编码>:<SSRC>,<平台编码>:0
             String callId = client().invite(deviceId, channel, offer, null);
             sessionManager.bindCallId(session, callId);
-            log.info("已发起下载 INVITE: {} mediaUri={} callId={}",
-                    session, mediaUri, callId);
+            log.info("已发起下载 INVITE: {} mediaUri={} 倍速={} callId={}",
+                    session, mediaUri, downloadSpeed, callId);
             return session;
         } catch (RuntimeException e) {
             // 同实时点播：INVITE 失败必须回滚，否则留下永不 ONLINE 的僵尸会话
@@ -1233,6 +1305,16 @@ public class Gb28181MediaService implements SipCallback {
      * </ol>
      */
     SdpMessage buildPlaybackSdp(RtpSession session, RecordItem item) {
+        return buildPlaybackSdp(session, item, SPEED_UNLIMITED);
+    }
+
+    /**
+     * 构造回放 / 下载 INVITE 的 SDP。
+     *
+     * @param downloadSpeed 请求设备按几倍速推送；{@link #SPEED_UNLIMITED}（1）
+     *                      表示<b>不下发</b> {@code a=downloadspeed}，即按实时速度推流
+     */
+    SdpMessage buildPlaybackSdp(RtpSession session, RecordItem item, int downloadSpeed) {
         long start = RecordItem.epochSecond(item.getStartTime());
         long end = RecordItem.epochSecond(item.getEndTime());
         // t= 为「会话活跃时间」：结束时间未知时退化为起点（标准允许）
@@ -1252,7 +1334,7 @@ public class Gb28181MediaService implements SipCallback {
                     ? session.getDeviceId() : session.getChannelId();
             uri = (channel == null ? "" : channel) + ":0";
         }
-        return new SdpMessage()
+        SdpMessage sdp = new SdpMessage()
                 .origin(props.getPlatformId(), props.getMediaIp())
                 .sessionName(SdpMessage.S_PLAYBACK)
                 .uri(uri)
@@ -1267,6 +1349,17 @@ public class Gb28181MediaService implements SipCallback {
                 .rtpmap("99", "H265")
                 .recvonly()
                 .ssrc(session.getSsrc());
+        /*
+         * 只在确实要倍速时才写 a=downloadspeed。
+         *
+         * <p>普通回放（1 倍速）不写：一是与改造前的报文完全一致，
+         * 不会让「看回放」被设备当成下载请求；二是部分设备严格校验
+         * 倍速档位，写 1 反而可能被拒。
+         */
+        if (downloadSpeed > SPEED_UNLIMITED) {
+            sdp.downloadspeed(downloadSpeed);
+        }
+        return sdp;
     }
 
     private void reject(InviteEvent event, int statusCode) {
@@ -1274,6 +1367,64 @@ public class Gb28181MediaService implements SipCallback {
             client().rejectInvite(event.getRawRequestEvent(), statusCode);
         } catch (Exception e) {
             log.error("拒绝 INVITE 失败: callId={} code={}", event.getCallId(), statusCode, e);
+        }
+    }
+
+    /**
+     * 对端是否为已注册的设备。
+     *
+     * <p>注册表不可用时<b>视为已注册</b>（放行）：宁可少拒一次，
+     * 也不要因为装配顺序问题把所有设备点播挡在门外 —— 那会把一个
+     * 「公网扫描骚扰」问题升级成「平台完全不可用」。
+     */
+    private boolean isRegisteredDevice(String peerId) {
+        Gb28181SipServer server = sipServer;
+        if (server == null) {
+            return true;
+        }
+        try {
+            // 不用 var：本模块的编译目标低于 Java 10，var 会报「找不到符号」
+            io.github.rurulalanana.gb28181.sip.device.DeviceRegistry registry =
+                    server.deviceRegistry();
+            return registry != null && registry.get(peerId) != null;
+        } catch (Exception e) {
+            log.debug("查询设备注册表失败，本次放行: peer={} {}", peerId, e.getMessage());
+            return true;
+        }
+    }
+
+    /**
+     * 被拒绝的 INVITE 的限流日志。
+     *
+     * <p>公网扫描器会持续打同一个端口（本机实测约 30 次/小时、24 小时不停），
+     * 每次都打 WARN 会在一天里刷出几百行、一年几十万行，把真正有用的日志
+     * 埋掉。这里按 <b>来源 IP + 拒绝原因</b> 限流：同一个来源 5 分钟内只打一条，
+     * 并带上累计次数，既不丢信息也不刷屏。
+     *
+     * <p>日志里必须带<b>来源 IP 与 Request-URI</b>：只写
+     * 「暂不支持的 INVITE 类型: s=-」等于没说，
+     * 运维既看不出是谁在打、也分不清是自己的设备还是外部扫描。
+     */
+    private void logRejectThrottled(String peerId, InviteEvent event, String reason) {
+        String ip = event.getPeer() == null ? "?" : event.getPeer().getIp();
+        String key = ip + "|" + reason;
+        long now = System.currentTimeMillis();
+        Long lastAt = lastRejectLogAt.get(key);
+        int hits = lastRejectLogCount.merge(key, 1, Integer::sum);
+        if (lastAt != null && now - lastAt < REJECT_LOG_INTERVAL_MS) {
+            return;
+        }
+        lastRejectLogAt.put(key, now);
+        lastRejectLogCount.put(key, 0);
+        log.warn("拒绝 INVITE: {} 来源={} 对端编码={} s={} subject={} callId={}（该来源累计 {} 次，同期同类已折叠）",
+                reason, ip, peerId,
+                event.getSdp() == null ? null : event.getSdp().getSessionName(),
+                event.getSubject(), event.getCallId(), hits);
+        // 避免 Map 无限增长：清理过期条目
+        if (lastRejectLogAt.size() > 256) {
+            long deadline = now - REJECT_LOG_INTERVAL_MS;
+            lastRejectLogAt.entrySet().removeIf(e -> e.getValue() < deadline);
+            lastRejectLogCount.keySet().retainAll(lastRejectLogAt.keySet());
         }
     }
 

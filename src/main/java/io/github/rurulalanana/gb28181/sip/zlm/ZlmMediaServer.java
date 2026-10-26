@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -789,7 +790,23 @@ public class ZlmMediaServer {
                 // 本来没有 sender 时会失败，忽略
             }
 
-            String useSsrc = ssrc == null || ssrc.trim().isEmpty() ? null : ssrc.trim();
+            /*
+             * SSRC 绝不能传 null。
+             *
+             * <p>原生实现第一行就是
+             * {@code assert(ctx && dst_url && ssrc)} —— C 的 {@code assert} 在
+             * release 构建里通常被裁掉，但这一版 <b>没有</b>裁：传 null 会直接
+             * 抛 {@code toolkit::AssertFailedException}，进程 abort，
+             * 表现为「JVM 被 SIGABRT 杀掉 + core dumped」，日志里只有一行
+             * {@code Assertion failed: (ctx && dst_url && ssrc), function
+             * mk_media_source_start_send_rtp4}。Java 侧完全抓不到。
+             *
+             * <p>什么时候会没有 ssrc：上级平台 INVITE 的 SDP 里没写
+             * {@code y=} 字段。GB/T 28181 里该字段是可选的，所以这是常态，
+             * 不能当作异常跳过 —— 自己生成一个符合规范格式的。
+             */
+            String useSsrc = ssrc == null || ssrc.trim().isEmpty()
+                    ? generatedSsrc() : ssrc.trim();
 
             // con_type：0=tcp主动 1=udp主动 2=tcp被动 3=udp被动
             int conType = tcp ? 0 : 1;
@@ -811,8 +828,7 @@ public class ZlmMediaServer {
                             // localPort 是 16 位无符号端口，JNA 映射成有符号 short，
                             // 直接打印会出现 -31126 这样的负数
                             log.info("级联推流已建立: 本地端口={} → {}:{} ssrc={} con_type={}",
-                                    localPort & 0xFFFF, dstIp, dstPort,
-                                    useSsrc == null ? "(源默认)" : useSsrc, conType);
+                                    localPort & 0xFFFF, dstIp, dstPort, useSsrc, conType);
                         } else {
                             log.error("级联推流失败: 目标 {}:{} err={} msg={}",
                                     dstIp, dstPort, err, msg);
@@ -836,13 +852,26 @@ public class ZlmMediaServer {
                 // 释放失败不影响推流
             }
             log.info("已发起级联推流: {}:{} → {}:{} ssrc={} con_type={}",
-                    useApp, stream, dstIp, dstPort,
-                    useSsrc == null ? "(源默认)" : useSsrc, conType);
+                    useApp, stream, dstIp, dstPort, useSsrc, conType);
             return true;
         } catch (Throwable t) {
             log.warn("级联上行推流启动失败: {} {}", stream, t.toString());
             return false;
         }
+    }
+
+    /**
+     * 生成一个符合 GB/T 28181 附录 D 的 SSRC（10 位十进制字符串）。
+     *
+     * <p>规范里前 1 位表示用途（{@code 1} 为实时点播，{@code 2} 为历史回放等），
+     * 其余 9 位任意。这里固定用 {@code 1} 开头 —— 级联上行推的是实时流。
+     *
+     * <p>为什么要自己造：上级 INVITE 不带 {@code y=} 时我们手上没有 SSRC，
+     * 而原生实现把 {@code ssrc} 当必有参数断言（见上方的说明），
+     * 传 null 会直接把进程 abort 掉。
+     */
+    private static String generatedSsrc() {
+        return String.format("1%09d", ThreadLocalRandom.current().nextInt(1_000_000_000));
     }
 
     /**
@@ -1127,6 +1156,20 @@ public class ZlmMediaServer {
         setOption(a, "rtp.ps_pt", props.getPsPayloadType());
         setOption(a, "rtp.h264_pt", props.getH264PayloadType());
         setOption(a, "rtp.h265_pt", props.getH265PayloadType());
+        /*
+         * RTP 收流 socket 的接收缓冲。
+         *
+         * 设备收到 INVITE 后会把攒着的码流一次性倾出（实测首秒包量 ≈ 稳态 2.4 倍），
+         * 缓冲不够时内核直接丢包，而丢的恰好是开头的 SPS/PPS + 首个 I 帧 ——
+         * ZLM 等不到视频轨就把它永久丢弃（Track not ready ... ignored: H264），
+         * 媒体源从此只有音频，浏览器永远黑屏。详见
+         * MediaServerProperties#udpRecvSocketBuffer 的说明。
+         *
+         * 注意：Linux 会把 SO_RCVBUF 夹到 net.core.rmem_max（默认常为 208KB），
+         * 所以宿主机还需 sysctl -w net.core.rmem_max=16777216 配套。
+         */
+        setOption(a, "rtp_proxy.udp_recv_socket_buffer",
+                String.valueOf(props.getUdpRecvSocketBuffer()));
     }
 
     private void setOption(ZLMApi a, String key, int value) {
@@ -1196,7 +1239,7 @@ public class ZlmMediaServer {
      * 缺任何一项都会导致对应的播放协议不可用：
      * <ul>
      *   <li>{@code protocol.enable_hls} —— 不开则 HLS 切片不生成</li>
-     *   <li>{@code hls.hls_save_path} / {@code http.rootPath} —— 切片落盘目录</li>
+     *   <li>{@code protocol.hls_save_path} / {@code http.rootPath} —— 切片落盘目录</li>
      *   <li>{@code general.streamNoneReaderDelayMS} —— 无人观看判定时长</li>
      * </ul>
      */
@@ -1219,7 +1262,22 @@ public class ZlmMediaServer {
         setOption(a, "rtmp.enhanced", props.isRtmpEnhanced() ? "1" : "0");
 
         // ---- [hls] 切片 ----
-        setOption(a, "hls.hls_save_path", props.getHlsSavePath());
+        /*
+         * 注意 section：{@code hls_save_path} 属于 <b>[protocol]</b> 段，
+         * 不是 [hls] 段（[hls] 只有 segDur/segNum/segRetain/segKeep/deleteDelaySec）。
+         *
+         * <p>写成 {@code hls.hls_save_path} 时 {@code mk_set_option} 只是往
+         * ini 里塞了一个没人读的键 —— 不报错、不生效。后果很难查：
+         * 切片会落到 ZLM 的默认相对路径（宿主机里是
+         * {@code $JAVA_HOME/bin/www}，因为 zlm4j 的“可执行文件”就是 java），
+         * 而 {@code http.rootPath} 指向我们配置的目录。
+         * 表现为 <b>m3u8 能拉到、每个 .ts 都 404</b>，播放器停在「网络错误」。
+         *
+         * <p>两者的取值直接从原生库里扒出来校对过：
+         * {@code hls_save_path}（无前缀，属 protocol）、{@code http.rootPath}、
+         * {@code hls.segDur} / {@code hls.segNum} / {@code hls.segRetain}。
+         */
+        setOption(a, "protocol.hls_save_path", props.getHlsSavePath());
         setOption(a, "hls.segDur", String.valueOf(props.getHlsSegDur()));
         setOption(a, "hls.segNum", String.valueOf(props.getHlsSegNum()));
         setOption(a, "hls.segRetain", String.valueOf(props.getHlsSegRetain()));
