@@ -86,9 +86,19 @@ public class Gb28181MediaService implements SipCallback {
      */
     private static final long RECORD_RESPONSE_WATCH_MS = 30_000L;
 
-    /** 观察设备响应的线程（不阻塞信令线程，也不占用分页收口调度器）。 */
+    /**
+     * 观察设备响应的线程池。
+     *
+     * <p><b>必须是多线程</b>：每个观察任务会阻塞到 {@link #RECORD_RESPONSE_WATCH_MS}
+     * （设备不回时就是等满 30 秒）。单线程时后续任务只能排队：
+     * 用户快速切换 3 个通道，第 2、3 个的观察要到 30 秒、60 秒后才开始执行 ——
+     * 而业务侧 20 秒就放弃了，于是<b>最需要原因的场景（设备不回）恰恰拿不到原因</b>。
+     *
+     * <p>4 个线程覆盖「同时看几个通道」的常见操作；线程是 daemon，
+     * 随 JVM 退出，不影响停机。
+     */
     private final java.util.concurrent.ExecutorService recordResponseWatcher =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            java.util.concurrent.Executors.newFixedThreadPool(4, r -> {
                 Thread t = new Thread(r, "gb28181-record-resp");
                 t.setDaemon(true);
                 return t;
@@ -902,6 +912,21 @@ public class Gb28181MediaService implements SipCallback {
                     log.warn("录像检索被设备拒绝: channel={} {}", key, reason);
                 } catch (Exception e) {
                     log.debug("观察录像应答失败: channel={} {}", key, e.toString());
+                } finally {
+                    /*
+                     * 必须清掉这个 Call-ID 的响应缓存。
+                     *
+                     * <p>录像检索每次都用新 Call-ID（{@code client().queryRecordInfo}），
+                     * 而 {@code Gb28181SipClient.responses} 是 Map —— 不清就是
+                     * 「每检索一次泄漏一条 Response」。实测环境一天几十次检索、
+                     * 每条含完整头字段，长期运行会缓慢涨内存。
+                     * 级联注册那边早就按同样理由清了（CascadeRegistrar）。
+                     */
+                    try {
+                        client().forgetCallId(callId);
+                    } catch (Exception ignore) {
+                        // 服务停止中 client 可能已不可用，忽略
+                    }
                 }
             });
         } catch (Exception e) {
