@@ -1293,6 +1293,21 @@ public class ZlmMediaServer {
         setOption(a, "general.maxStreamWaitMS", String.valueOf(props.getMaxStreamWaitMs()));
         setOption(a, "general.streamNoneReaderDelayMS",
                 String.valueOf(props.getStreamNoneReaderDelayMs()));
+        /*
+         * 等轨就绪的时间与未就绪帧缓存。
+         *
+         * <p>ZLM 默认 wait_track_ready_ms=10000、unready_frame_cache=100，
+         * 对「设备慢起推」的录像段都不够：实测同一通道有的段 6ms 就齐了，
+         * 有的要 11 秒。超过 10 秒那一档会被**永久丢弃视频轨**
+         * （{@code Track not ready for a long time, ignored: H264}），
+         * 媒体源从此只有 PCMA，播放器永远黑屏、重连无效。
+         *
+         * <p>详见 {@code MediaServerProperties#waitTrackReadyMs} 的说明。
+         */
+        setOption(a, "general.wait_track_ready_ms",
+                String.valueOf(props.getWaitTrackReadyMs()));
+        setOption(a, "general.unready_frame_cache",
+                String.valueOf(props.getUnreadyFrameCache()));
 
         // ---- [protocol] MP4 录制计为观看者 ----
         // ZLM 默认 mp4_as_player=0：MP4 录制任务不计入观看者数

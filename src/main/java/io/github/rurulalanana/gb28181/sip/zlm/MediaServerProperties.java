@@ -217,6 +217,41 @@ public class MediaServerProperties {
     @Builder.Default
     private final int udpRecvSocketBuffer = 8 * 1024 * 1024;
 
+    /**
+     * {@code [general] wait_track_ready_ms}：等各条轨就绪的最长时间（毫秒）。
+     *
+     * <p><b>这是决定「这段录像能不能播」的关键参数。</b>ZLM 收流后会等所有轨
+     * （视频 + 音频）都就绪才建媒体源；时间一到，没就绪的轨会被
+     * <b>永久丢弃</b>：
+     * <pre>All track ready use 10064ms
+     *Track not ready for a long time, ignored: H264
+     *codec info: PCMA[8000/1/16]          ← 只剩音频</pre>
+     * 此后媒体源就只有音频，浏览器永远是黑屏，重连一万次也没用。
+     *
+     * <p><b>为什么默认不能是 10 秒</b>：ZLM 默认 10000ms，而国标设备（尤其
+     * 经下级平台代理的）从接受 INVITE 到真正推视频流差别极大 —— 实测同一通道
+     * 有的录像段 6ms 就齐了，有的要 11 秒。10 秒的阈值恰好卡在后者之外，
+     * 于是「有些录像能播、有些怎么都播不出来」，而日志里只有一行 warning。
+     *
+     * <p>代价只是「设备一直不推视频时多等一会儿」—— 这是后台收流，不影响
+     * 用户交互；而把 30 秒内才起推的段救回来是实打实的收益。
+     */
+    @Builder.Default
+    private final int waitTrackReadyMs = 30000;
+
+    /**
+     * {@code [general] unready_frame_cache}：轨未就绪期间缓存的帧数上限。
+     *
+     * <p>超过这个数量就会丢弃最早的缓存帧（日志
+     * {@code Cached frame of unready track(H264) is too much, now cleared}）。
+     * 默认 100 帧，对 25fps 只有 4 秒 —— 设备慢起推时开头的 SPS/PPS + I 帧
+     * 很容易被清掉，于是即便等到了视频轨，首个关键帧也已经没了。
+     *
+     * <p>放大到 500 帧（约 20 秒 @25fps）配合 {@link #waitTrackReadyMs} 一起用。
+     */
+    @Builder.Default
+    private final int unreadyFrameCache = 500;
+
     /** ZLM 虚拟主机名（默认虚拟主机）。 */
     @Builder.Default
     private final String vhost = "__defaultVhost__";
