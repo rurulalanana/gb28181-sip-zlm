@@ -63,6 +63,68 @@ public class Gb28181MediaService implements SipCallback {
     private final RtpSessionManager sessionManager;
     private final MediaServerProperties props;
 
+    /**
+     * 设备对录像检索的<b>拒绝原因</b>（通道编码 → 人类可读原因）。
+     *
+     * <p><b>为什么需要它</b>：设备拒绝 RecordInfo 时往往会在 SIP 响应里说明原因，
+     * 例如实测 LiveGBS 会回
+     * {@code 400 wait for recordinfo timeout[15s]}即「我去问下级摄像机超时了」。
+     * 而业务侧只看到「一条帧都没收到」，于是报「设备未应答」——
+     * 运维拿到这个提示只能去查网络，而真正要查的是设备/摄像机。
+     *
+     * <p>放在这里而不是透传回调里，是为了不改动
+     * {@code Consumer<List<RecordItem>>} 这个既有契约（调用方已经很多）。
+     * 业务侧在超时后调 {@link #lastRecordFailure(String)} 取一次即可。
+     */
+    private final Map<String, String> recordFailures = new ConcurrentHashMap<>();
+
+    /**
+     * 观察设备响应的等待时长（毫秒）。
+     *
+     * <p>要比业务侧的检索超时略长：这样「设备先拒绝、业务后超时」的顺序成立，
+     * 业务取原因时一定已经写好了。
+     */
+    private static final long RECORD_RESPONSE_WATCH_MS = 30_000L;
+
+    /** 观察设备响应的线程（不阻塞信令线程，也不占用分页收口调度器）。 */
+    private final java.util.concurrent.ExecutorService recordResponseWatcher =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "gb28181-record-resp");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * 取设备对上一次录像检索的拒绝原因。
+     *
+     * @return 形如 {@code 设备返回 400 wait for recordinfo timeout[15s]}；
+     *         设备未拒绝（或仍在处理）时返回 {@code null}
+     */
+    public String lastRecordFailure(String channelId) {
+        return channelId == null ? null : recordFailures.get(channelId);
+    }
+
+    /**
+     * 录像分页聚合的收口调度器。
+     *
+     * <p><b>为什么要独立调度</b>：收口条件有两个 —— ①已收齐 {@code SumNum}；
+     * ②设备不再发帧。①由应答处理顺带判断即可，②却必须靠<b>时间</b>推进：
+     * 设备把该发的都发完就安静了，不会再有事件来触发检查。
+     *
+     * <p>早先的实现把②也挂在 {@code onManscdpResponse} 里「顺带触发」，
+     * 于是「设备少报 SumNum」或「设备只发了一部分就停」的场景永远等不到收口，
+     * 业务侧只能耗尽 {@code future.get(timeout)} 的全部超时（实测固定 15 秒），
+     * 用户看到的就是「查询录像卡、慢、超时」。
+     *
+     * <p>单线程 + 守护性：只做「看时间戳、收口、回调」，每次几十微秒。
+     */
+    private final java.util.concurrent.ScheduledExecutorService recordPagerTicker =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "gb28181-record-pager");
+                t.setDaemon(true);
+                return t;
+            });
+
     /** 信令服务器（start 后由平台装配），用于 respondInvite / invitePlayback 等。 */
     private volatile Gb28181SipServer sipServer;
 
@@ -98,6 +160,15 @@ public class Gb28181MediaService implements SipCallback {
         this.mediaServer = mediaServer;
         this.sessionManager = sessionManager;
         this.props = props;
+        /*
+         * 每 300ms 检查一次空闲批次。
+         *
+         * <p>周期要明显小于 {@link RecordPager#IDLE_MS}（1200ms）：
+         * 否则收口会比「设备已停发」晚一整拍，用户仍会感觉到额外等待。
+         * 300ms 兼顾响应速度与唤醒次数（每秒 3 次空转成本可忽略）。
+         */
+        recordPagerTicker.scheduleWithFixedDelay(this::expireIdleRecordPagers,
+                300, 300, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     /** 挂载信令回调委派对象；传 {@code null} 取消委派。 */
@@ -798,7 +869,45 @@ public class Gb28181MediaService implements SipCallback {
         String key = channelId == null || channelId.trim().isEmpty() ? sipTarget : channelId;
         recordCallbacks.put(key, new AtomicReference<>(onRecords));
         recordPagers.put(key, new RecordPager(key));
-        client().queryRecordInfo(sipTarget, key, startTime, endTime);
+        // 上一轮的拒绝原因不能留到这一轮，否则会把旧故障当成新故障报给用户
+        recordFailures.remove(key);
+        String callId = client().queryRecordInfo(sipTarget, key, startTime, endTime);
+        watchRecordResponse(key, callId);
+    }
+
+    /**
+     * 后台观察本次检索的 SIP 最终响应，把设备的拒绝原因记下来。
+     *
+     * <p><b>为什么不在信令线程里等</b>：设备可能要十几秒才回（它自己在等下级），
+     * 阻塞信令线程会直接影响注册、心跳、点播等所有信令。
+     *
+     * <p>只关心 {@code >= 300}：{@code 200 OK} 表示设备受理，
+     * 真正的录像列表随后以独立的 MANSCDP 帧到达（走分页聚合）。
+     */
+    private void watchRecordResponse(String key, String callId) {
+        if (callId == null) {
+            return;
+        }
+        try {
+            recordResponseWatcher.execute(() -> {
+                try {
+                    javax.sip.message.Response resp =
+                            client().awaitResponse(callId, RECORD_RESPONSE_WATCH_MS);
+                    if (resp == null || resp.getStatusCode() < 300) {
+                        return;
+                    }
+                    String reason = "设备返回 " + resp.getStatusCode()
+                            + (resp.getReasonPhrase() == null ? "" : " " + resp.getReasonPhrase());
+                    recordFailures.put(key, reason);
+                    log.warn("录像检索被设备拒绝: channel={} {}", key, reason);
+                } catch (Exception e) {
+                    log.debug("观察录像应答失败: channel={} {}", key, e.toString());
+                }
+            });
+        } catch (Exception e) {
+            // 线程池已关闭（服务停止中）时忽略
+            log.debug("提交应答观察任务失败: {}", e.toString());
+        }
     }
 
     /**
@@ -817,14 +926,32 @@ public class Gb28181MediaService implements SipCallback {
      */
     private static final class RecordPager {
 
-        /** 无新帧多久判定收口（毫秒）。 */
-        static final long IDLE_MS = 1200L;
+        /**
+         * 无新帧多久判定收口（毫秒）。
+         *
+         * <p><b>为什么是 2 秒而不是 1 秒</b>：设备返回录像列表时往往是
+         * 「一大串快发 + 偶发停顿」。停顿超过阈値就会提前收口，
+         * 丢掉后面那几段 —— 而这种丢法很难发现（列表看着正常，只是少了几行）。
+         * 2 秒比正常帧间隔大一个数量级，仍远小于业务侧 15 秒超时。
+         */
+        static final long IDLE_MS = 2000L;
 
         private final String key;
         private final java.util.List<RecordItem> items = new java.util.ArrayList<>();
         private final Map<String, RecordItem> unique = new java.util.LinkedHashMap<>();
-        private volatile int sumNum;
+        /** 设备声明的总段数；{@code -1} 表示还没声明过。 */
+        private volatile int sumNum = -1;
         private volatile long lastFrameAt = System.currentTimeMillis();
+        /**
+         * 是否收到过 RecordInfo 帧。
+         *
+         * <p><b>不能用 {@code unique.isEmpty()} 代替</b>：设备完全可以权威地答
+         * 「这个时段没有录像」（{@code <SumNum>0</SumNum>} 且无 {@code <Item>}），
+         * 那是有效答案而不是「没应答」。混为一谈会让「确实没录像」
+         * 白白等满整个业务超时（实测 LiveGBS 对无录像的通道 1 秒就回了
+         * {@code SumNum=0}，而平台仍爬到 20 秒超时）。
+         */
+        private volatile boolean framesReceived;
         private volatile boolean done;
 
         RecordPager(String key) {
@@ -838,8 +965,10 @@ public class Gb28181MediaService implements SipCallback {
          */
         synchronized boolean accept(ManscdpMessage msg, List<RecordItem> frame) {
             lastFrameAt = System.currentTimeMillis();
+            framesReceived = true;
             Integer declared = msg == null ? null : msg.intOf("SumNum");
-            if (declared != null && declared > 0) {
+            // 0 也要采信：那是设备在明确告知「该时段没有录像」
+            if (declared != null && declared >= 0) {
                 sumNum = declared;
             }
             for (RecordItem item : frame) {
@@ -852,14 +981,37 @@ public class Gb28181MediaService implements SipCallback {
                         + "|" + item.getName();
                 unique.put(id, item);
             }
+            /*
+             * 收口条件一：设备声明了总数且已收齐。
+             *
+             * 收口条件二：设备声明 0 段且本帧确实没带条目 —— 这就是完整答案，
+             * 立即回调，不要白等（否则界面上的「正在查询」会拖满整个超时）。
+             */
             if (sumNum > 0 && unique.size() >= sumNum) {
+                done = true;
+                return true;
+            }
+            if (sumNum == 0 && unique.isEmpty()) {
                 done = true;
                 return true;
             }
             return false;
         }
 
-        /** 空闲超时兜底：设备少报或丢包时，把已收到的交上去。 */
+        /**
+         * 空闲超时兜底：设备少报或丢包时，把已收到的交上去。
+         *
+         * <p>两种场景靠它收口：
+         * <ul>
+         *   <li>设备根本<b>不发 {@code SumNum}</b>（实测部分通道如此）——
+         *       此时 {@code sumNum} 恒为 -1，能收齐的条件永远不成立；</li>
+         *   <li>设备少报 {@code SumNum}，或中途丢包。</li>
+         * </ul>
+         *
+         * <p><b>只要收到过帧就收口</b>（哪怕条目为 0）：收到过就说明设备已应答，
+         * 结论（含「没有录像」）是可信的。一帧都没收到才继续等 ——
+         * 那种情况应归为「设备未应答」。
+         */
         boolean expireIfIdle() {
             if (done) {
                 return false;
@@ -868,7 +1020,12 @@ public class Gb28181MediaService implements SipCallback {
                 return false;
             }
             done = true;
-            return !unique.isEmpty();
+            return framesReceived;
+        }
+
+        /** 该批次是否已经收到过帧（用于判断「应没应答」与「答了空的」）。 */
+        boolean receivedAny() {
+            return framesReceived;
         }
 
         List<RecordItem> snapshot() {
@@ -878,7 +1035,7 @@ public class Gb28181MediaService implements SipCallback {
         @Override
         public String toString() {
             return "RecordPager{" + key + ", 已收 " + unique.size()
-                    + "/" + (sumNum > 0 ? sumNum : "?") + "}";
+                    + "/" + (sumNum >= 0 ? sumNum : "?") + "}";
         }
     }
 
@@ -888,21 +1045,24 @@ public class Gb28181MediaService implements SipCallback {
     /**
      * 检查所有空闲超时的录像聚合批次并收口。
      *
-     * <p>由 {@link #onManscdpResponse} 在每帧之后顺带触发，<b>不另起线程</b>：
-     * 录像查询不是热路径，为它常驻一个调度线程不值得。
-     * 代价是「设备只回了一帧不完整的应答」时要等下一次任意 MANSCDP 应答才收口 ——
-     * 而这种情况业务侧的 {@code future.get(timeout)} 本来就会先超时，
-     * 不会让用户多等。
+     * <p>由 {@link #recordPagerTicker} 定期驱动，<b>不能只靠</b>
+     * {@code onManscdpResponse} 顺带触发：设备停发之后就不会再有任何应答，
+     * 靠事件驱动的收口永远不会发生（详见字段上的说明）。
      */
     private void expireIdleRecordPagers() {
-        for (Map.Entry<String, RecordPager> e : recordPagers.entrySet()) {
-            RecordPager pager = e.getValue();
-            if (!pager.expireIfIdle()) {
-                continue;
+        try {
+            for (Map.Entry<String, RecordPager> e : recordPagers.entrySet()) {
+                RecordPager pager = e.getValue();
+                if (!pager.expireIfIdle()) {
+                    continue;
+                }
+                if (recordPagers.remove(e.getKey(), pager)) {
+                    completeRecordQuery(e.getKey(), pager);
+                }
             }
-            if (recordPagers.remove(e.getKey(), pager)) {
-                completeRecordQuery(e.getKey(), pager);
-            }
+        } catch (Exception ex) {
+            // 调度任务里抛出异常会让后续周期全部取消，必须吞掉
+            log.warn("录像聚合空闲收口异常: {}", ex.toString());
         }
     }
 
@@ -917,30 +1077,70 @@ public class Gb28181MediaService implements SipCallback {
     }
 
     /**
+     * 一次录像检索「未正常收口」时取走的结果。
+     *
+     * @param items          已收到的录像段
+     * @param framesReceived 是否<b>收到过任何</b> RecordInfo 帧
+     */
+    public static final class RecordDrain {
+        private final List<RecordItem> items;
+        private final boolean framesReceived;
+
+        RecordDrain(List<RecordItem> items, boolean framesReceived) {
+            this.items = items;
+            this.framesReceived = framesReceived;
+        }
+
+        public List<RecordItem> items() {
+            return items;
+        }
+
+        /**
+         * 设备到底有没有应答。
+         *
+         * <p>这个区分比条数重要得多：<b>没收到任何帧</b>说明设备没答（离线、
+         * 设备侧检索故障），<b>收到了帧但段数为 0</b> 说明设备明确回了
+         * 「这段时间没有录像」。两者在业务侧的处理完全相反，
+         * 混成一个空列表就是在报假警。
+         */
+        public boolean framesReceived() {
+            return framesReceived;
+        }
+    }
+
+    /**
      * 取走某通道尚未收口的录像聚合结果（并把回调置空）。
      *
-     * <p>用途：设备少报了 {@code SumNum}、或分页帧中途丢包时，
-     * 聚合永远等不到「收齐」条件。业务侧{@code future.get(timeout)} 超时后
-     * 调用本方法，可以拿到<b>已经收到的那些</b>，而不是整体丢弃——
-     * 对用户来说「看到 5 段」远好于「一段都没有」。
+     * <p>用途：业务侧等待超时后，把<b>已经收到的那些</b>拿走而不是整体丢弃 ——
+     * 对用户来说「看到 5 段」远好于「一段都没有」，而「一帧都没收到」
+     * 则要明确告知设备未应答。
      *
-     * @return 已聚合的录像段；没有在处理中的批次时返回空列表
+     * @return 已聚合结果（永不为 {@code null}）
      */
-    public List<RecordItem> takePendingRecords(String channelId) {
+    public RecordDrain drainRecordQuery(String channelId) {
         if (channelId == null) {
-            return java.util.Collections.emptyList();
+            return new RecordDrain(java.util.Collections.emptyList(), false);
         }
         RecordPager pager = recordPagers.remove(channelId);
         recordCallbacks.remove(channelId);
         if (pager == null) {
-            return java.util.Collections.emptyList();
+            return new RecordDrain(java.util.Collections.emptyList(), false);
         }
         List<RecordItem> items = pager.snapshot();
-        if (!items.isEmpty()) {
-            log.warn("录像检索未收齐即取走: channel={} 已收 {} 段 {}",
-                    channelId, items.size(), pager);
+        boolean any = pager.receivedAny();
+        if (any) {
+            log.info("录像检索超时取走: channel={} 已收 {} 段 {}", channelId, items.size(), pager);
         }
-        return items;
+        return new RecordDrain(items, any);
+    }
+
+    /**
+     * 取走某通道尚未收口的录像段（仅要数据、不关心是否有帧）。
+     *
+     * @return 已聚合的录像段；没有在处理中的批次时返回空列表
+     */
+    public List<RecordItem> takePendingRecords(String channelId) {
+        return drainRecordQuery(channelId).items();
     }
 
     @Override
@@ -964,7 +1164,7 @@ public class Gb28181MediaService implements SipCallback {
                     completeRecordQuery(deviceId, pager);
                 }
             }
-            // 顺带收口其它空闲批次（设备少报/丢包时的兜底）
+            // 顺带收口其它空闲批次（设备少报/丢包时的兜底）；定时器也会做同样的事
             expireIdleRecordPagers();
         }
         SipCallback delegate = callbackDelegate;

@@ -139,15 +139,31 @@ public class RecordItem {
         return items;
     }
 
-    /** 国标时间格式 {@code yyyy-MM-dd'T'HH:mm:ss}（兼容毫秒与时区后缀，按设备本地时间解释）。 */
+    /**
+     * 国标时间解析：兼容带 {@code T} 与空格两种写法（毫秒/时区后缀也接受），
+     * 一律按设备本地时间（GMT+8）解释。
+     *
+     * <p><b>为什么两种都要认</b>：标准表 45 要求 {@code yyyy-MM-ddTHH:mm:ss}，
+     * 但相当一部分设备（含部分国产 NVR）回的是空格分隔的
+     * {@code 2026-10-26 12:00:00}。原实现用 {@code indexOf('T')} 判断有没有时间部分，
+     * 空格形式会被当成<b>纯日期</b>套 {@code yyyy-MM-dd} 解析，且
+     * {@code setLenient(false)} 让它直接失败返回 {@code null} ——
+     * 于是整条录像被丢弃（{@code cacheDeviceRecords} 会跳过 startTime 为空的项），
+     * 界面上表现为「设备明明回了录像但一段都看不到」。
+     */
     public static Date parseTime(String text) {
         if (text == null || text.trim().isEmpty()) {
             return null;
         }
-        String value = text.trim();
-        String normalized = value;
+        String normalized = text.trim();
         if (normalized.endsWith("Z")) {
             normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        // 空格写法先归一成标准写法，后续逻辑只需处理一种形态
+        int space = normalized.indexOf(' ');
+        if (normalized.indexOf('T') < 0 && space > 0) {
+            normalized = normalized.substring(0, space) + "T"
+                    + normalized.substring(space + 1).trim();
         }
         boolean hasTime = normalized.indexOf('T') > 0;
         String pattern;
