@@ -766,6 +766,28 @@ public class Gb28181MediaService implements SipCallback {
             log.debug("无人观看，但未找到对应会话（可能已关闭）: app={} stream={}", app, stream);
             return false;
         }
+        /*
+         * 关流前复核「是不是真的没人看了」。
+         *
+         * <p><b>为什么不能只信 ZLM 的判定</b>：这条回调由 ZLM 原生层在
+         * {@code general.streamNoneReaderDelayMS}（默认 45 秒）内数不到读者时触发。
+         * 而本平台的直播是浏览器<b>直连</b> ZLM 的 48089 拉 ws-flv，
+         * 若那一刻读者数被数漏（HLS/TS 按需源尚未建立、播放器刚重连的间隙等），
+         * ZLM 就会认为没人看 —— 于是<b>正在观看的流被判死刑</b>，
+         * 用户看到的是「看着看着突然断了，重连又能看」。
+         *
+         * <p>改造前这里是无条件关流，等于把 ZLM 的判断当成了事实。
+         * 现在先问一次应用层心跳：播放器每 20 秒上报一次，只要还在心跳
+         * 就说明真的有人在看，必须保留（只打日志、不发 BYE、不关会话）。
+         *
+         * <p>心跳过期（用户关掉页面 / 停止播放）后，下一轮回调或
+         * {@code StreamService#reapIdleStreams} 会正常回收，不会漏关。
+         */
+        if (hasRecentView(session.getSessionKey())) {
+            log.info("无人观看回调：ZLM 读者数为 0，但前端仍在心跳，保留会话 {}（不发 BYE）",
+                    session.getSessionKey());
+            return false;
+        }
         log.info("无人观看超时，关闭会话: {}", session);
         // 记冷却再关流：设备不认 BYE（实测 LiveGBS）会继续推流，
         // 不记冷却就会被孤儿流巡检立刻认领回来，形成
@@ -775,7 +797,81 @@ public class Gb28181MediaService implements SipCallback {
         sessionManager.markReaped(session.getSessionKey());
         // BYE 由 closeByKey 统一发送（见 teardownHook）
         sessionManager.closeByKey(session.getSessionKey());
+        clearViewTouch(session.getSessionKey());
         return true;
+    }
+
+    // ==================== 观看心跳 ====================
+
+    /**
+     * 观看心跳间隔（毫秒）。业务方须与此值保持一致。
+     *
+     * <p>选 20 秒：小于 {@link #VIEW_TOUCH_TTL_MS}（45 秒），
+     * 两次心跳之间不会过期，中间丢一次也仍有余量。
+     */
+    public static final long VIEW_TOUCH_INTERVAL_MS = 20_000L;
+
+    /**
+     * 心跳有效期（毫秒）：超过这么久没收到心跳就算「没人看了」。
+     *
+     * <p>取 45 秒与 ZLM 的 {@code general.streamNoneReaderDelayMS} 默认值对齐：
+     * 若用户关掉页面，最长约 45 秒后流会被正常回收，不会永久占着设备带宽。
+     */
+    public static final long VIEW_TOUCH_TTL_MS = 45_000L;
+
+    /**
+     * 观看心跳：会话键 → 最后一次心跳时刻。
+     *
+     * <p><b>为什么放在媒体层而不是业务层</b>：关流有两个入口 ——
+     * ZLM 的无人观看回调（{@link #onNoViewer}）与业务层的空闲巡检
+     * （{@code StreamService#reapIdleStreams}）。两者必须用<b>同一份</b>
+     * 判断，否则「一个入口认、另一个不认」就会出现「巡检保住了、
+     * 但 ZLM 回调几秒后又把它关掉」这种自相矛盾的行为。
+     * 而 ZLM 回调在媒体层，拿不到业务层的表，因此表就放在这里，
+     * 业务层通过 {@link #touchView} 上报、通过 {@link #hasRecentView} 查询。
+     *
+     * <p>条目数 = 同时在播的会话数，量级极小。
+     */
+    private final java.util.Map<String, Long> viewTouches = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 记录一次观看心跳（业务层在收到前端心跳时调用）。
+     *
+     * @param sessionKey 会话键（{@code 设备/通道}，回放另带类型后缀）
+     */
+    public void touchView(String sessionKey) {
+        if (sessionKey == null || sessionKey.trim().isEmpty()) {
+            return;
+        }
+        viewTouches.put(sessionKey, System.currentTimeMillis());
+    }
+
+    /**
+     * 该会话最近是否有前端心跳（= 真的还有人在看）。
+     *
+     * @return {@code true} 表示心跳仍在有效期内，不应关流
+     */
+    public boolean hasRecentView(String sessionKey) {
+        if (sessionKey == null) {
+            return false;
+        }
+        Long at = viewTouches.get(sessionKey);
+        if (at == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - at <= VIEW_TOUCH_TTL_MS) {
+            return true;
+        }
+        // 过期条目顺手清掉：否则换过的通道会永久留下无用记录
+        viewTouches.remove(sessionKey, at);
+        return false;
+    }
+
+    /** 清掉某会话的心跳记录（会话关闭/停止时调用，避免残留）。 */
+    public void clearViewTouch(String sessionKey) {
+        if (sessionKey != null) {
+            viewTouches.remove(sessionKey);
+        }
     }
 
     /**
