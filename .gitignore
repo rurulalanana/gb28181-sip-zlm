@@ -23,3 +23,7 @@ target/
 # 本地配置与凭据
 *.local
 .env
+
+# ZLMediaKit 运行时产物：默认 www 目录下会落录像/截图，
+# 是测试残留而非源码，不入库。
+www/
