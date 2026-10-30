@@ -244,13 +244,45 @@ public class MediaServerProperties {
      *
      * <p>超过这个数量就会丢弃最早的缓存帧（日志
      * {@code Cached frame of unready track(H264) is too much, now cleared}）。
-     * 默认 100 帧，对 25fps 只有 4 秒 —— 设备慢起推时开头的 SPS/PPS + I 帧
+     * ZLM 默认 100 帧，对 25fps 只有 4 秒 —— 设备慢起推时开头的 SPS/PPS + I 帧
      * 很容易被清掉，于是即便等到了视频轨，首个关键帧也已经没了。
      *
-     * <p>放大到 500 帧（约 20 秒 @25fps）配合 {@link #waitTrackReadyMs} 一起用。
+     * <p><b>为什么从 500 再提到 2000</b>：实测失败样本里先被清的是
+     * <b>PCMA</b> 而不是 H264 ——
+     * <pre>Cached frame of unready track(PCMA) is too much, now cleared
+     *Track not ready for a long time, ignored: H264</pre>
+     * 音频 8kHz / 每帧 20ms，500 帧只有 10 秒；音频先把配额占满，
+     * 视频轨的帧就无处可缓存，最终等不到关键帧而被丢弃。
+     * 2000 帧对音频约 40 秒、对 15fps 视频约 133 秒，两条轨都够用。
+     *
+     * <p>内存代价可接受：一帧 PS 解出的裸帧通常 1~4KB，2000 帧约 2~8MB/路。
      */
     @Builder.Default
-    private final int unreadyFrameCache = 500;
+    private final int unreadyFrameCache = 2000;
+
+    /**
+     * {@code [general] wait_add_track_ms}：流当前只有单轨时，最多等多久才认定
+     * 它就是单轨流。
+     *
+     * <p>ZLM 默认 3000ms。语义（官方 config.ini 注释）：
+     * <pre>如果流只有单Track，最多等待若干毫秒，超时后未收到其他Track的数据，
+     *则认为是单Track。如果协议元数据有声明特定track数，那么无此等待时间。</pre>
+     *
+     * <p><b>为什么默认 3 秒对国标设备不够</b>：GB28181 的 PS 封装常常先把
+     * 音频包送上来、视频 I 帧晚几秒才到。3 秒一到，ZLM 认为「这就是单轨流」，
+     * 后续到达的视频轨只能一直处于<b>未就绪</b>状态，最终在
+     * {@link #waitTrackReadyMs} 超时后被永久丢弃：
+     * <pre>Got track: H264
+     *Got track: PCMA
+     *(3 秒后 ZLM 认定单轨，开始正常出音频)
+     *(30 秒后) Track not ready for a long time, ignored: H264</pre>
+     * 现象就是「有声音没画面」，且重连播放器完全无效 —— 媒体源里已经没有视频轨了。
+     *
+     * <p>提到 10 秒与 {@link #waitTrackReadyMs} 配合：先给视频轨足够时间加入，
+     * 真的不来再按单轨处理，不至于白等到 30 秒。
+     */
+    @Builder.Default
+    private final int waitAddTrackMs = 10000;
 
     /** ZLM 虚拟主机名（默认虚拟主机）。 */
     @Builder.Default

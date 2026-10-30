@@ -6,7 +6,7 @@
 
   <groupId>io.github.rurulalanana</groupId>
   <artifactId>gb28181-sip-zlm</artifactId>
-  <version>1.0.10</version>
+  <version>1.0.11</version>
   <packaging>jar</packaging>
 
   <name>gb28181-sip-zlm</name>

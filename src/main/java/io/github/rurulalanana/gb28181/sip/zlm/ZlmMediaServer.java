@@ -1066,6 +1066,62 @@ public class ZlmMediaServer {
     }
 
     /**
+     * 诊断用：列出某路流每个协议源各自的读者数。
+     *
+     * <p><b>用途</b>：{@link #readerCount} 只返回归并后的最大值，排查
+     * 「没人看却一直不回收」时分不清读者来自哪个协议 —— 是真实播放器
+     * （rtmp/fmp4/rtsp），还是 HLS 切片器、录制器这类 ZLM 内部消费者。
+     * 把它们逐个打出来才能定位。
+     *
+     * <p><b>尚未验证的假设</b>：HLS 切片器、MP4 录制器是否真的计入
+     * {@code total_reader_count} 目前<b>没有直接观测证据</b>。
+     * {@code protocol.mp4_as_player=1} 的注释声称录制器算 reader，
+     * 但那是基于 ZLM 源码注释的推断，未经本环境实测确认。
+     * 需要时用本方法的 {@code .own} 字段（该协议自己的读者数）
+     * 与 {@code total} 对照来判断。
+     *
+     * <p>返回形如 {@code {hls=1, hls.own=0, rtmp=0, rtmp.own=0}}：
+     * 无后缀的是整路流的总数（各源相同），{@code .own} 是该协议自己的。
+     * 流不存在时返回空 Map。
+     *
+     * @param app    ZLM 应用名
+     * @param stream ZLM 流名
+     */
+    public Map<String, Integer> readerDetail(String app, String stream) {
+        Map<String, Integer> detail = new java.util.LinkedHashMap<>();
+        if (StringUtils.isBlank(app) || StringUtils.isBlank(stream)) {
+            return detail;
+        }
+        try {
+            com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
+                if (source == null) {
+                    return;
+                }
+                try {
+                    if (!app.equals(api().mk_media_source_get_app(source))
+                            || !stream.equals(api().mk_media_source_get_stream(source))) {
+                        return;
+                    }
+                    String schema = api().mk_media_source_get_schema(source);
+                    int total = api().mk_media_source_get_total_reader_count(source);
+                    int own = api().mk_media_source_get_reader_count(source);
+                    detail.put(String.valueOf(schema), total);
+                    // own 是该协议自己的读者数，total 是整路流的（各源相同）。
+                    // 两个都记下来：own > 0 说明这个协议确实有人在用。
+                    detail.put(String.valueOf(schema) + ".own", own);
+                } catch (Throwable t) {
+                    log.debug("查询媒体源读者明细失败: {}", t.toString());
+                }
+            };
+            pinCallbackThread(cb);
+            api().mk_media_source_for_each(null, cb, "", "", "", "");
+        } catch (Throwable t) {
+            log.debug("遍历媒体源失败: {}", t.toString());
+        }
+        return detail;
+    }
+
+    /**
      * 列出所有「流名仍是 SSRC 十六进制串」的媒体源（= 未被平台纳管的孤儿流）。
      *
      * <p><b>为什么靠流名判定</b>：单端口模式下，被正常纳管的流其流名会被推流回调
@@ -1251,7 +1307,28 @@ public class ZlmMediaServer {
         setOption(a, "protocol.enable_rtmp", props.isEnableRtmp() ? "1" : "0");
         setOption(a, "protocol.enable_rtsp", props.isEnableRtsp() ? "1" : "0");
         setOption(a, "protocol.enable_audio", props.isEnableAudio() ? "1" : "0");
-        setOption(a, "protocol.hls_demand", "0");
+        /*
+         * HLS 按需生成（hls_demand=1）。
+         *
+         * <p>置 0 时 ZLM 对每路流<b>常开</b> HLS 切片器（不管有没有人看），
+         * 持续切 TS、写磁盘、占 CPU。本平台的直播主通路是 WebRTC /
+         * WebSocket-FLV，HLS 只是兜底协议（切协议菜单里的最后一项），
+         * 为它常驻一套切片器不划算。
+         *
+         * <p>代价：第一个 HLS 观众要多等一个切片周期（{@code hls.segDur}=2 秒）。
+         *
+         * <p><b>注意：hls_demand 与「空闲流回收不掉」无关</b>。
+         * 曾怀疑常开的切片器被计入 reader 导致巡检永不关流，但
+         * 日志统计否证了这个假设 —— 130 个会话里 77% 在 45~65 秒正常回收，
+         * 长挂的（100 秒以上）全部落在「录像计划生效期间」，那是
+         * {@code channelsRequiringStream()} 刻意保持常开的正确行为。
+         * 若将来真的出现「无录像、无观众却不回收」，用
+         * {@link #readerDetail} 打印各协议源的读者数来定位，
+         * 不要凭 hls 源仍注册就下结论。
+         *
+         * <p>其余三个 demand 保持 0：它们不产生常驻后台任务，且关掉会拖慢首帧。
+         */
+        setOption(a, "protocol.hls_demand", "1");
         setOption(a, "protocol.rtmp_demand", "0");
         setOption(a, "protocol.ts_demand", "0");
         setOption(a, "protocol.fmp4_demand", "0");
@@ -1308,6 +1385,22 @@ public class ZlmMediaServer {
                 String.valueOf(props.getWaitTrackReadyMs()));
         setOption(a, "general.unready_frame_cache",
                 String.valueOf(props.getUnreadyFrameCache()));
+        /*
+         * 单轨判定窗口。
+         *
+         * <p>ZLM 默认 3000ms：流里只有一条轨时，等 3 秒还没等到另一条轨的数据，
+         * 就认定「这是单轨流」并开始正常输出。
+         *
+         * <p><b>国标设备 3 秒不够</b>：PS 封装常常先把音频送上来，视频 I 帧晚几秒才到。
+         * 一旦被判定成单轨流，后到的视频轨只能停留在「未就绪」，
+         * 最终在 wait_track_ready_ms 超时后被永久丢弃
+         * （{@code Track not ready for a long time, ignored: H264}），
+         * 媒体源从此只剩 PCMA —— 现象是「有声音没画面」，重连播放器无效。
+         *
+         * <p>详见 {@code MediaServerProperties#waitAddTrackMs} 的说明。
+         */
+        setOption(a, "general.wait_add_track_ms",
+                String.valueOf(props.getWaitAddTrackMs()));
 
         // ---- [protocol] MP4 录制计为观看者 ----
         // ZLM 默认 mp4_as_player=0：MP4 录制任务不计入观看者数
