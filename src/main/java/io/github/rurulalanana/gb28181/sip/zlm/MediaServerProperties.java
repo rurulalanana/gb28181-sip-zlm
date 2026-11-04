@@ -147,6 +147,14 @@ public class MediaServerProperties {
      *
      * <p>留空时回退 {@link #mediaIp}（同机部署时二者相同）。
      * 仅在 WebRTC 走独立入口时才需要单独覆盖。
+     *
+     * <p><b>本地调试必须单独配</b>：{@code media-ip} 往往是线上那套公网 IP，
+     * 本机浏览器把 ICE 包发过去收不到回包 —— 协商成功、画面全黑、15 秒后
+     * ZLM 打「接受rtp/rtcp/datachannel超时」。而 FLV 走 HTTP 回源不受影响，
+     * 于是现象是「FLV 能播、WebRTC 不能」。填 {@link #AUTO} 可自动取默认路由
+     * 所在网卡的 IPv4，免去手工查 ipconfig。
+     *
+     * <p><b>线上不要填 {@link #AUTO}</b>：NAT 部署时这里必须是对外公网地址。
      */
     @Builder.Default
     private final String rtcExternIp = null;
@@ -415,8 +423,69 @@ public class MediaServerProperties {
 
     // ==================== 内部工具 ====================
 
-    /** 探测本机第一个非回环 IPv4 地址；失败时退回 127.0.0.1。 */
+    /**
+     * 虚拟网卡名特征（小写匹配）。
+     *
+     * <p><b>为什么要排除它们</b>：{@link #detectLocalIp()} 取的是「第一块可用网卡」，
+     * 而装了 VMware / VirtualBox / Docker / WSL 的开发机上，虚拟网卡往往排在最前面。
+     * 实测本机（Windows）第一个非回环 IPv4 是 {@code 192.168.80.1}（VMware 的 VMnet8），
+     * 于是 ZLM 把它当成对外地址写进 SDP：
+     * <pre>
+     *   MediaServer(192.168.80.1:18000:8000)
+     *   a=candidate:… 1 udp 120 192.168.80.1 18000 typ host
+     * </pre>
+     * 局域网里的浏览器根本到不了这个地址 —— 现象就是<b>WebRTC 协商成功但画面永远 0×0</b>，
+     * 15 秒后 ZLM 打「接受rtp/rtcp/datachannel超时」。而 FLV 走 HTTP 回源，不受影响，
+     * 所以极易误判成「WebRTC 坏了」。
+     */
+    private static final String[] VIRTUAL_IFACE_HINTS = {
+            "vmnet", "vmware", "virtualbox", "vboxnet", "hyper-v", "vethernet",
+            "docker", "br-", "veth", "virbr", "wsl", "tap", "tun", "ppp",
+            "tailscale", "zerotier", "ham", "radmin", "npcap", "loopback"
+    };
+
+    /**
+     * {@code rtc-extern-ip} 的魔法值：自动取<b>默认路由所在网卡</b>的 IPv4。
+     *
+     * <p>本机/局域网调试不用再手工查 ipconfig：{@code --gb28181.rtc-extern-ip=auto}
+     * 就得到一个浏览器和同网段同事都能到达的地址。
+     * 线上不配这一项，仍走 {@link #mediaIp}（公网地址），行为完全不变。
+     */
+    public static final String AUTO = "auto";
+
+    /**
+     * 探测默认路由所在网卡的 IPv4（本机对外的「主地址」）。
+     *
+     * <p>做法：建一个 UDP socket {@code connect} 到一个公网地址再读 local address。
+     * UDP 的 {@code connect} <b>不发任何报文</b>，只是让内核按路由表选源地址，
+     * 所以不需要外网真的可达，也不产生流量。拿不到时退回 {@link #detectLocalIp()}。
+     *
+     * <p><b>为什么不直接用 {@link #detectLocalIp()}</b>：装了 VMware/VirtualBox 的
+     * 机器上虚拟网卡常常排在真网卡前面（实测本机第一个是 {@code 192.168.80.1}），
+     * 那个地址同网段的其它机器根本到不了。
+     */
+    static String detectRouteLocalIp() {
+        try (java.net.DatagramSocket probe = new java.net.DatagramSocket()) {
+            // 8.8.8.8 只用于查路由表，UDP connect 不会发包，也不需要可达
+            probe.connect(InetAddress.getByName("8.8.8.8"), 53);
+            InetAddress local = probe.getLocalAddress();
+            if (local != null && !local.isAnyLocalAddress() && !local.isLoopbackAddress()
+                    && local.getAddress().length == 4) {
+                return local.getHostAddress();
+            }
+        } catch (Exception ignore) {
+            // 没有默认路由（纯内网/离线机器）：退回按网卡枚举
+        }
+        return detectLocalIp();
+    }
+
+    /**
+     * 探测本机对外 IPv4 地址：优先物理网卡，没有可用物理网卡时才退回虚拟网卡。
+     *
+     * <p>失败时退回 {@code 127.0.0.1}（局域网内不可用，但至少不会是 {@code null}）。
+     */
     static String detectLocalIp() {
+        String virtualFallback = null;
         try {
             Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
             while (ifaces.hasMoreElements()) {
@@ -424,17 +493,80 @@ public class MediaServerProperties {
                 if (iface.isLoopback() || !iface.isUp()) {
                     continue;
                 }
-                Enumeration<InetAddress> addrs = iface.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress addr = addrs.nextElement();
-                    if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
-                        return addr.getHostAddress();
-                    }
+                String ip = firstIpv4(iface);
+                if (ip == null) {
+                    continue;
                 }
+                if (isVirtualIface(iface)) {
+                    // 先记下来：万一这台机器只有虚拟网卡（容器/WSL 里跑），也不能返回 null
+                    if (virtualFallback == null) {
+                        virtualFallback = ip;
+                    }
+                    continue;
+                }
+                return ip;
             }
         } catch (SocketException ignore) {
             // 探测失败退回回环地址
         }
-        return "127.0.0.1";
+        return virtualFallback != null ? virtualFallback : "127.0.0.1";
+    }
+
+    /** 取某块网卡上第一个 IPv4 地址；没有返回 {@code null}。 */
+    private static String firstIpv4(NetworkInterface iface) {
+        Enumeration<InetAddress> addrs = iface.getInetAddresses();
+        while (addrs.hasMoreElements()) {
+            InetAddress addr = addrs.nextElement();
+            if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                return addr.getHostAddress();
+            }
+        }
+        return null;
+    }
+
+    /** 是否是虚拟/隧道网卡（按网卡名判断，见 {@link #VIRTUAL_IFACE_HINTS}）。 */
+    private static boolean isVirtualIface(NetworkInterface iface) {
+        String name = iface.getName() == null ? "" : iface.getName().toLowerCase();
+        String display = iface.getDisplayName() == null ? "" : iface.getDisplayName().toLowerCase();
+        for (String hint : VIRTUAL_IFACE_HINTS) {
+            if (name.contains(hint) || display.contains(hint)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 某个 IP 是否真的配置在本机某块网卡上（含虚拟网卡与回环）。
+     *
+     * <p>给 WebRTC 候选地址做体检用：{@code rtc.externIP} 指向的地址若不在本机，
+     * 说明服务在 NAT 后面（线上正常）<b>或者</b>配置还留着线上那套公网 IP
+     * （本地跑就成了必然连不上）。两种情况日志该说清楚，见
+     * {@code ZlmMediaServer#logRtcCandidate}。
+     */
+    static boolean isLocalAddress(String ip) {
+        // 本模块编译目标是 Java 8：不能用 String.isBlank()（JDK 11+）
+        if (ip == null || ip.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            if ("127.0.0.1".equals(ip.trim()) || "localhost".equalsIgnoreCase(ip.trim())) {
+                return true;
+            }
+            InetAddress target = InetAddress.getByName(ip.trim());
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    if (addrs.nextElement().equals(target)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignore) {
+            // 解析失败按「不是本机地址」处理：只影响一行日志的措辞
+        }
+        return false;
     }
 }

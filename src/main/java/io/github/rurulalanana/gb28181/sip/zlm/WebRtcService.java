@@ -73,9 +73,9 @@ public class WebRtcService {
             if (sdp != null && !sdp.isEmpty()) {
                 answer.complete(sdp);
             } else {
+                String raw = err == null ? "未知错误" : err;
                 answer.completeExceptionally(new IllegalStateException(
-                        "ZLM 生成 answer 失败: " + (err == null ? "未知错误" : err)
-                                + "（协商地址 " + rtcUrl + "，请确认该流已建立）"));
+                        explain(raw) + "（协商地址 " + rtcUrl + "）"));
             }
         };
         peer.setCallback(onAnswer);
@@ -103,6 +103,37 @@ public class WebRtcService {
                 removed.setCallback(null);
             }
         }
+    }
+
+    /**
+     * 把 ZLM 的原生错误翻译成能直接给用户看的话。
+     *
+     * <p><b>最常见的一种必须单独解释</b>：{@code Assertion failed: (have_active_media ...)}
+     * 的真实含义是「浏览器 offer 里的编码与流里的编码没有交集」，
+     * 99% 的情况是<b>流是 H265，而这个浏览器的 offer 里没有 H265</b>。
+     * 原样把 C++ 断言抛给用户，只会让人以为平台坏了 ——
+     * 实际是解码器/协议的能力边界，改任何平台配置都不会好。
+     */
+    private static String explain(String raw) {
+        String s = raw == null ? "" : raw;
+        if (s.contains("have_active_media")) {
+            /*
+             * 措辞要准确：不是「WebRTC 不支持 H265」——
+             * 实测 ZLM 1.13 是支持的（answer 会回 a=rtpmap:98 H265/90000），
+             * 真正缺的是浏览器侧：H265 in WebRTC 只有 Chrome ≥136（需硬件 HEVC 解码）
+             * 与 Safari 支持，Edge / Firefox / 国产浏览器都没跟上。
+             * 写成「WebRTC 不支持」会把人引去改 ZLM 配置，白费功夫。
+             */
+            return "WebRTC 协商失败：流里的视频编码与浏览器 offer 没有交集。"
+                    + "常见原因是设备输出 H265，而当前浏览器的 offer 里没有 H265"
+                    + "（H265/HEVC 的 WebRTC 只有 Chrome ≥136 与 Safari 支持，"
+                    + "Edge / Firefox / 国产浏览器不支持）。"
+                    + "解决办法：换 Chrome ≥136、或把设备编码改成 H264，或改用 FLV/HLS 播放";
+        }
+        if (s.contains("stream not found") || s.contains("NotFound")) {
+            return "WebRTC 协商失败：媒体源不存在，流可能已断开。请重新点播后再切协议";
+        }
+        return "ZLM 生成 answer 失败: " + (s.isEmpty() ? "未知错误" : s);
     }
 
     /** 应用层回调的强引用持有者（JNA 回调不允许被 GC）。 */

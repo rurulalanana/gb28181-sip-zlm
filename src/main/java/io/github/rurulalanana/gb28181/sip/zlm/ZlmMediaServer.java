@@ -98,6 +98,12 @@ public class ZlmMediaServer {
     private volatile int rtcPort;
 
     /**
+     * 实际生效的 WebRTC 候选地址（{@code rtc.externIP}），start 后在
+     * {@link #applyProtocolOptions} 里落值；见 {@link #getRtcCandidateIp()}。
+     */
+    private volatile String rtcCandidateIp;
+
+    /**
      * 流事件监听者。
      *
      * <p>是<b>列表</b>而不是单个字段：媒体平台内部需要用它驱动会话状态
@@ -504,6 +510,92 @@ public class ZlmMediaServer {
     public PlayUrls playUrls(RtpSession session) {
         return session == null ? null : playUrls(session.getZlmApp(), session.getStream());
     }
+
+    /**
+     * 让 ZLM 主动拉取一路外部流（RTSP / RTMP / HTTP-FLV 等）并注册成媒体源。
+     *
+     * <p><b>用在哪</b>：SDK 直连设备（大华等）不走国标 SIP，没有 RTP 推流，
+     * 只能由平台给出设备的 RTSP 地址，让 ZLM 去拉。拉进来之后
+     * FLV / WS-FLV / HLS / WebRTC 的输出链路与国标设备完全一致，
+     * 前端播放器不需要任何改动。
+     *
+     * <p><b>与 {@code mk_load_mp4_file} 的区别</b>：那个是「本地文件 → 源」，
+     * 第 1 个参数是文件路径；本方法走 proxy player，URL 必须带协议头
+     * （传 {@code app/stream} 会报 {@code not supported play schema}）。
+     *
+     * <p><b>为什么不用 ZLM 的 HTTP API</b>：嵌入式 ZLM 的 {@code /index/api/*}
+     * 是关闭的（实测全部 404），只能走 zlm4j 的 JNA 接口。
+     *
+     * @param app    应用名（与国标一致：设备编码）
+     * @param stream 流名（通道编码）
+     * @param url    完整拉流地址，如 {@code rtsp://user:pass@ip:554/cam/realmonitor?...}
+     * @param enableMp4 是否同时录制为 MP4（沿用 ZLM 的 record 全局配置）
+     * @return 是否成功发起拉流
+     */
+    public boolean startProxy(String app, String stream, String url, boolean enableMp4) {
+        if (StringUtils.isBlank(app) || StringUtils.isBlank(stream) || StringUtils.isBlank(url)) {
+            return false;
+        }
+        ZLMApi a = api();
+        /*
+         * 必须先释放上一个代理玩家，再关源，最后才创建。
+         *
+         * 只关源是不够的：proxy player 自己持有拉流会话，源被关掉后它仍在拉，
+         * 下一次 mk_proxy_player_play 会立刻收到
+         * "media source already existed: rtsp://__defaultVhost__/app/stream"，
+         * 于是两个玩家抢同一路源 —— 实测表现为流状态在 ONLINE / NEGOTIATING
+         * 之间反复跳，播放器时好时坏。
+         */
+        stopProxy(app, stream);
+        closeMediaSource(app, stream);
+        com.aizuda.zlm4j.structure.MK_PROXY_PLAYER player =
+                a.mk_proxy_player_create(props.getVhost(), app, stream, 0, enableMp4 ? 1 : 0);
+        if (player == null) {
+            log.warn("ZLM 创建代理播放器失败: {}/{} url={}", app, stream, url);
+            return false;
+        }
+        try {
+            a.mk_proxy_player_play(player, url);
+        } catch (Throwable t) {
+            // 原生层拉流失败不抛 Java 异常，只在日志里体现；这里兜住 JNA 层的意外错误
+            log.warn("ZLM 代理拉流异常: {}/{} url={} err={}", app, stream, url, t.toString());
+            return false;
+        }
+        proxyPlayers.put(app + "/" + stream, player);
+        log.info("ZLM 已发起代理拉流: {}/{} <- {}", app, stream, maskUrl(url));
+        return true;
+    }
+
+    /** 停止代理拉流并回收播放器句柄。 */
+    public void stopProxy(String app, String stream) {
+        com.aizuda.zlm4j.structure.MK_PROXY_PLAYER player =
+                proxyPlayers.remove(app + "/" + stream);
+        if (player == null) {
+            return;
+        }
+        try {
+            api().mk_proxy_player_release(player);
+            log.info("ZLM 已停止代理拉流: {}/{}", app, stream);
+        } catch (Throwable t) {
+            log.warn("停止代理拉流失败: {}/{} err={}", app, stream, t.toString());
+        }
+    }
+
+    /** 当前活跃的代理播放器（{@code app/stream} → 句柄）。 */
+    private final Map<String, com.aizuda.zlm4j.structure.MK_PROXY_PLAYER> proxyPlayers =
+            new ConcurrentHashMap<>();
+
+    /**
+     * 去掉 URL 里的密码再打日志：RTSP 地址形如
+     * {@code rtsp://user:pass@ip:554/...}，直接打会把设备密码写进日志。
+     */
+    private static String maskUrl(String url) {
+        if (url == null) {
+            return null;
+        }
+        return url.replaceAll("//([^:/@]+):([^@]*)@", "//$1:***@");
+    }
+
 
     /**
      * 查询某路流的 RTP 接收状态。
@@ -914,6 +1006,97 @@ public class ZlmMediaServer {
         String url = "rtc://" + DEFAULT_VHOST + "/" + app + "/" + stream;
         log.debug("WebRTC 协商地址: {}", url);
         return url;
+    }
+
+    /**
+     * 查询某路流<b>视频轨</b>的实际编码名（{@code H264} / {@code H265}）；流不存在返回 {@code null}。
+     *
+     * <p><b>为什么需要它</b>：WebRTC 能不能播，第一决定因素不是网络而是编码。
+     * ZLM 不会转码，它<b>直接把流本身的编码</b>写进 SDP answer：
+     * <pre>
+     *   流是 H265 → a=rtpmap:98 H265/90000
+     *   流是 H264 → a=rtpmap:96 H264/90000
+     * </pre>
+     * 于是「浏览器不支持 H265」时就只剩两种表现，而且都不好排查：
+     * <ul>
+     *   <li>浏览器 offer 里没有 H265（Chrome &lt;136、Edge、Firefox）→ ZLM 断言
+     *       {@code Assertion failed: (have_active_media …)}，消息里一个字都没提编码；</li>
+     *   <li>offer 里有 H265 但解码器不可用 → 协商成功、画面全黑。</li>
+     * </ul>
+     * 把编码查出来打进日志/应答，这两种情况都能一眼定性。
+     *
+     * <p>实现上全部在 {@code mk_media_source_for_each} 的回调里完成：媒体源句柄只在遍历
+     * 期间有效，跨线程持有会拿到悬垂指针（见 {@link #closeMediaSource} 的两阶段说明）。
+     *
+     * <p>{@code mk_media_source_get_track} 返回的是 ZLM 内部<b>借用</b>的指针
+     * （C++ 侧 {@code getTrack(i).get()}），<b>不能</b>调 {@code mk_track_unref} ——
+     * 那会把引用计数减到 0 并释放掉媒体源自己的轨道。
+     *
+     * @param app    ZLM 应用名（单端口模式下是 {@code rtp}）
+     * @param stream ZLM 流名（{@code <设备编码>_<通道编码>}）
+     */
+    public String videoCodecName(String app, String stream) {
+        if (StringUtils.isBlank(app) || StringUtils.isBlank(stream)) {
+            return null;
+        }
+        // 回调里写、回调外读，用数组兜值（lambda 不能改外部局部变量）
+        final String[] codec = new String[1];
+        try {
+            com.aizuda.zlm4j.callback.IMKSourceFindCallBack cb = (userData, source) -> {
+                if (source == null || codec[0] != null) {
+                    return;
+                }
+                try {
+                    if (!app.equals(api().mk_media_source_get_app(source))
+                            || !stream.equals(api().mk_media_source_get_stream(source))) {
+                        return;
+                    }
+                    int count = api().mk_media_source_get_track_count(source);
+                    for (int i = 0; i < count; i++) {
+                        com.aizuda.zlm4j.structure.MK_TRACK track =
+                                api().mk_media_source_get_track(source, i);
+                        // 借用指针，不 unref（见方法注释）
+                        if (track == null || api().mk_track_is_video(track) == 0) {
+                            continue;
+                        }
+                        String name = api().mk_track_codec_name(track);
+                        if (name != null && !name.isEmpty()) {
+                            codec[0] = name;
+                            return;
+                        }
+                    }
+                } catch (Throwable t) {
+                    log.debug("读取视频轨编码失败: {}", t.toString());
+                }
+            };
+            pinCallbackThread(cb);
+            api().mk_media_source_for_each(null, cb, "", "", app, stream);
+        } catch (Throwable t) {
+            log.debug("遍历媒体源失败: app={} stream={} {}", app, stream, t.toString());
+        }
+        return codec[0];
+    }
+
+    /**
+     * 该编码能否被浏览器通过 WebRTC 解码（用于给用户一句准确的话，不改变任何行为）。
+     *
+     * <p>结论来自实测 + 公开支持矩阵：
+     * <ul>
+     *   <li>H264 —— 所有浏览器都支持；</li>
+     *   <li>H265/HEVC —— <b>ZLM 侧能协商</b>（1.13 实测 answer 会返回 {@code H265/90000}），
+     *       但浏览器侧只有 Chrome ≥136（需硬件 HEVC 解码）、Safari 支持，
+     *       Edge / Firefox / 国产浏览器目前都不支持。</li>
+     * </ul>
+     * 因此这里只用于<b>提示</b>，绝不因为编码是 H265 就拒绝协商 —— 支持的浏览器上它是能播的。
+     *
+     * @param codecName {@link #videoCodecName} 的返回值；未知传 {@code null}
+     */
+    public static boolean isWebRtcVideoCodecRisky(String codecName) {
+        if (StringUtils.isBlank(codecName)) {
+            return false;
+        }
+        String name = codecName.trim().toUpperCase();
+        return name.contains("265") || name.contains("HEVC");
     }
 
     /**
@@ -1421,12 +1604,66 @@ public class ZlmMediaServer {
         // 两者通常相同（同一台机器），但若 WebRTC 走独立入口可单独覆盖。
         // 必须在 mk_rtc_server_start 之前设置：候选地址在服务启动时确定。
         String rtcExternIp = props.getRtcExternIp();
-        if (StringUtils.isBlank(rtcExternIp)) {
+        if (MediaServerProperties.AUTO.equalsIgnoreCase(
+                rtcExternIp == null ? "" : rtcExternIp.trim())) {
+            // 本地/局域网调试用：自动取默认路由所在网卡的 IPv4，
+            // 不用手工查 ipconfig（虚拟网卡会挑错，见 MediaServerProperties#detectRouteLocalIp）
+            rtcExternIp = MediaServerProperties.detectRouteLocalIp();
+            log.info("WebRTC 候选地址使用 auto 探测，得到本机主网卡 IP: {}", rtcExternIp);
+        } else if (StringUtils.isBlank(rtcExternIp)) {
             rtcExternIp = props.getMediaIp();
         }
+        rtcCandidateIp = rtcExternIp;
         setOption(a, "rtc.externIP", rtcExternIp);
         // 候选端口默认 8000，与实际监听的 rtc.port 不一致会让浏览器连错端口
         setOption(a, "rtc.port", String.valueOf(props.getRtcPort()));
+        logRtcCandidate(rtcExternIp, props.getRtcPort());
+    }
+
+    /**
+     * 当前实际下发给浏览器的 ICE 候选地址（{@code rtc.externIP} 的生效值）。
+     *
+     * <p>单一事实来源：{@code /api/v1/webrtc/config} 直接用它，避免界面展示一个值、
+     * ZLM 实际用另一个值（那正是「配置看着对但播不出来」的经典来源）。
+     * 未启动时返回 {@code null}。
+     */
+    public String getRtcCandidateIp() {
+        return rtcCandidateIp;
+    }
+
+    /**
+     * 打印 WebRTC 实际下发的 ICE 候选地址，并在「它不属于本机任何网卡」时给出提示。
+     *
+     * <p><b>为什么专门打这一行</b>：WebRTC 播不出画面时，第一件要知道的事就是
+     * 「浏览器会往哪个 {@code IP:端口} 发 SRTP」。这个地址由 {@code rtc.externIP}
+     * 决定（留空回退 {@code media-ip}），但此前它<b>不出现在任何日志里</b>——
+     * 现场只能去抓 SDP answer 才能看到，排查成本极高。实测线上/本地共用一个
+     * {@code media-ip} 时，本机跑起来的 answer 里 candidate 就是那个公网 IP：
+     * <pre>
+     *   a=candidate:bf99b657 1 udp 110 123.57.109.223 18000 typ host
+     * </pre>
+     * 浏览器把 STUN 打过去永远收不到回包，于是协商成功、画面全黑，
+     * 15 秒后 ZLM 打 {@code onShutdown | 接受rtp/rtcp/datachannel超时}。
+     *
+     * <p>「不属于本机网卡」本身<b>不是错误</b>：服务器在 NAT 后面时它就应该是公网地址。
+     * 所以这里只做 INFO 提示，不改任何行为、不影响线上。
+     */
+    private void logRtcCandidate(String candidateIp, int rtcPort) {
+        if (StringUtils.isBlank(candidateIp)) {
+            log.warn("WebRTC 候选地址为空：将退化为 ZLM 自动枚举网卡地址（多网卡机器可能选到"
+                    + "虚拟网卡，如 192.168.80.1，局域网浏览器连不上）");
+            return;
+        }
+        if (MediaServerProperties.isLocalAddress(candidateIp)) {
+            log.info("WebRTC 候选地址(rtc.externIP)={}:{}（本机网卡地址，局域网/本机浏览器可直连）",
+                    candidateIp, rtcPort);
+            return;
+        }
+        log.info("WebRTC 候选地址(rtc.externIP)={}:{} —— 该地址不属于本机任何网卡。"
+                        + "服务在 NAT 后面时这是正确配置；但若在本机/局域网里调试，"
+                        + "浏览器会把 ICE 包发到这个不可达地址，表现为【协商成功但画面全黑】。"
+                        + "局域网直连请在启动参数加 --gb28181.rtc-extern-ip=<本机局域网 IP>",
+                candidateIp, rtcPort);
     }
 
     private MK_EVENTS buildEvents(ZLMApi a) {
