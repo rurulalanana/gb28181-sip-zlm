@@ -97,6 +97,26 @@ public class RecordItem {
         return new RecordItem(deviceId, name, null, null, startTime, endTime, "time", 0L);
     }
 
+    /**
+     * 以 SDK 检索结果构造录像项。
+     *
+     * <p><b>为什么国标那两个工厂不够用</b>：{@link #ofFilePath} 没有起止时间
+     * （前端时间轴画不出来），{@link #ofRange} 没有文件路径（按文件下载用不了）。
+     * SDK（大华等）检索回来的结果两样都有，需要一个新的入口把它们一起带上。
+     *
+     * @param deviceId  设备/通道编码
+     * @param filePath  设备侧文件名
+     * @param name      显示名（通常就是文件名）
+     * @param startTime 起始时间
+     * @param endTime   结束时间
+     * @param fileSize  文件大小（字节）
+     */
+    public static RecordItem ofSdkRecord(String deviceId, String filePath, String name,
+                                         java.util.Date startTime, java.util.Date endTime,
+                                         long fileSize) {
+        return new RecordItem(deviceId, name, filePath, null, startTime, endTime, "sdk", fileSize);
+    }
+
     /** 从 {@code <Item>} 元素解析。 */
     static RecordItem from(Element item) {
         return new RecordItem(
