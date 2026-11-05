@@ -512,6 +512,25 @@ public class ZlmMediaServer {
     }
 
     /**
+     * 为一路「由平台自己喂帧」的流创建发布器（裸 H264/H265 ES → ZLM）。
+     *
+     * <p>用在 SDK 取流（大华等）：设备不推 RTP、也不允许平台反向拉 RTSP 时，
+     * 平台从 SDK 拿裸流直接 {@code mk_media_input_h264/265} 建流。
+     * 与国标收流（{@link RtpSessionManager}）并列，最终都由 ZLM 输出同一套协议。
+     *
+     * <p>HLS 开关跟随 {@code protocol.enable_hls}；MP4 录制传 0 ——
+     * 平台侧的录像由 {@code RecordingService} 单独管，不在这里重复开。
+     *
+     * @param app    应用名（= 设备编码）
+     * @param stream 流名（= 通道编码）
+     * @return 发布器；调用方负责 {@code close()}
+     */
+    public EsMediaPublisher createEsPublisher(String app, String stream) {
+        return new EsMediaPublisher(api(), props.getVhost(), app, stream,
+                props.isEnableHls(), false);
+    }
+
+    /**
      * 让 ZLM 主动拉取一路外部流（RTSP / RTMP / HTTP-FLV 等）并注册成媒体源。
      *
      * <p><b>用在哪</b>：SDK 直连设备（大华等）不走国标 SIP，没有 RTP 推流，
