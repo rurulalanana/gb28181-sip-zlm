@@ -531,6 +531,25 @@ public class ZlmMediaServer {
     }
 
     /**
+     * 为一路「设备推 PS 码流」的流创建解码器（PS → 裸 H264/H265）。
+     *
+     * <p>用在海康 ISUP：设备把 PS 推给平台 SMS 端口，平台不自己解 PS，
+     * 交给 ZLM 自带的 {@code mk_ps_decoder_*}，解出的裸流再喂 {@link EsMediaPublisher}。
+     *
+     * <p>与大华的 {@link EsMediaPublisher} 直接吃裸流是两条路：
+     * 大华 SDK 能直接给裸流，海康只能给 PS，所以中间多一层解码。
+     *
+     * @param app    应用名（= 设备编码）
+     * @param stream 流名（= 通道编码）
+     * @param sink   裸流接收方（通常是 {@code EsMediaPublisher::push}）
+     * @return 解码器；调用方负责 {@code close()}
+     */
+    public PsMediaDecoder createPsDecoder(String app, String stream,
+                                          PsMediaDecoder.FrameSink sink) {
+        return new PsMediaDecoder(api(), app, stream, sink);
+    }
+
+    /**
      * 让 ZLM 主动拉取一路外部流（RTSP / RTMP / HTTP-FLV 等）并注册成媒体源。
      *
      * <p><b>用在哪</b>：SDK 直连设备（大华等）不走国标 SIP，没有 RTP 推流，
